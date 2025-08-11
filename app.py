@@ -1,4 +1,4 @@
-# app.py - VERSIÓN COMPLETA CON ASISTENTE DE IA
+# app.py - VERSIÓN COMPLETA Y FINAL PARA DESPLIEGUE EN VERCEL
 
 import os
 import json
@@ -11,36 +11,70 @@ import speech_recognition as sr
 
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key: raise ValueError("No se encontró GOOGLE_API_KEY.")
+    if not api_key: raise ValueError("No se encontró la GOOGLE_API_KEY en las variables de entorno.")
     genai.configure(api_key=api_key)
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
 app = Flask(__name__)
-db.DATABASE_FILE = '/tmp/facturas.db' # Ruta para Vercel
+# Vercel solo permite escribir en /tmp, así que ponemos la BBDD ahí.
+db.DATABASE_FILE = '/tmp/facturas.db'
 db.init_db()
 
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
 prompt_plantilla_factura = """
-# ... tu prompt de extracción de facturas va aquí ...
+Actúa como un experto contable especializado en la extracción de datos de documentos.
+Analiza la siguiente imagen de una factura o ticket.
+Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON, sin texto introductorio, explicaciones o marcado de código.
+
+Los campos a extraer son:
+- emisor (El nombre de la empresa o persona que emite la factura)
+- cif (El identificador fiscal: CIF, NIF, VAT ID, etc.)
+- fecha (La fecha de emisión del documento en formato DD/MM/AAAA)
+- total (El importe total final pagado, como un número)
+- base_imponible (El subtotal antes de impuestos, como un número)
+- impuestos (Un objeto JSON con los diferentes tipos de impuesto y su valor. Ej: {"iva_21": 21.00, "otros_impuestos": 2.50})
+- conceptos (Una lista de objetos, donde cada objeto contiene 'descripcion', 'cantidad' y 'precio_unitario')
+
+Si un campo no se puede encontrar o no es aplicable, devuélvelo como `null`.
+Si los conceptos son difíciles de desglosar, extrae al menos una descripción general como un único concepto.
 """
 
 @app.route('/api/process_invoice', methods=['POST'])
 def process_invoice():
-    # ... (sin cambios)
+    if not request.data: return jsonify({"error": "No se ha enviado ninguna imagen"}), 400
+    try:
+        image_bytes = io.BytesIO(request.data); img = Image.open(image_bytes)
+        response = gemini_model.generate_content([prompt_plantilla_factura, img])
+        json_text = response.text.replace('```json', '').replace('```', '').strip()
+        extracted_data = json.loads(json_text)
+        db.add_invoice(extracted_data, "gemini-1.5-flash-latest (real)")
+        return jsonify({"ok": True, "data": extracted_data})
+    except Exception as e:
+        return jsonify({"error": f"Error del servidor de IA: {e}"}), 500
+
 @app.route('/api/invoices', methods=['GET'])
 def get_invoices():
-    # ... (sin cambios)
+    try:
+        invoices = db.get_all_invoices()
+        return jsonify({"ok": True, "invoices": invoices})
+    except Exception as e:
+        return jsonify({"error": f"Error del servidor: {e}"}), 500
+
 @app.route('/api/invoice/<int:invoice_id>', methods=['GET'])
 def get_invoice(invoice_id):
-    # ... (sin cambios)
+    try:
+        details = db.get_invoice_details(invoice_id)
+        if details: return jsonify({"ok": True, "invoice": details})
+        else: return jsonify({"ok": False, "error": "Factura no encontrada"}), 404
+    except Exception as e:
+        return jsonify({"error": f"Error del servidor: {e}"}), 500
 
-# >>> NUEVO "SÚPER ENDPOINT" PARA EL ASISTENTE <<<
+# Endpoint para el Asistente de IA
 @app.route('/api/assistant', methods=['POST'])
 def assistant_query():
     if not request.data: return jsonify({"ok": False, "respuesta_hablada": "No he recibido tu pregunta."})
-
     r = sr.Recognizer()
     with sr.AudioFile(io.BytesIO(request.data)) as source:
         audio_data = r.record(source)
@@ -51,48 +85,39 @@ def assistant_query():
 
     prompt_router = f"""
     Eres el cerebro de una app de gestión de facturas. El usuario ha dicho: "{text}".
-    Clasifica su intención y extrae las entidades.
-    Intenciones: 'buscar_facturas', 'resumen_mensual', 'predecir_gastos', 'pregunta_general'.
-    Entidades: 'emisor' (string), 'mes' (número del 1 al 12).
-    Responde SÓLO con JSON.
+    Clasifica su intención y extrae las entidades. Intenciones: 'buscar_facturas', 'resumen_mensual', 'predecir_gastos', 'pregunta_general'.
+    Entidades: 'emisor' (string), 'mes' (número del 1 al 12). Responde SÓLO con JSON.
     Ejemplos:
     - "Busca facturas de Vodafone" -> {{"intencion": "buscar_facturas", "entidades": {{"emisor": "Vodafone"}}}}
     - "Gastos de julio" -> {{"intencion": "buscar_facturas", "entidades": {{"mes": "7"}}}}
     - "Resumen mensual" -> {{"intencion": "resumen_mensual", "entidades": {{}}}}
     - "Crees que gastaré más el próximo mes" -> {{"intencion": "predecir_gastos", "entidades": {{}}}}
-    - "Cuál es el NIF de Apple" -> {{"intencion": "pregunta_general", "entidades": {{}}}}
     """
     try:
         response = gemini_model.generate_content(prompt_router)
         result = json.loads(response.text.strip().replace("'", '"'))
         intent = result.get("intencion")
         entities = result.get("entidades", {})
-        
-        respuesta_hablada = "No he entendido bien, ¿puedes repetirlo?"
-        datos = None
+        respuesta_hablada = "No he entendido bien, ¿puedes repetirlo?"; datos = None
 
         if intent == 'buscar_facturas':
             datos = db.search_invoices(entities)
-            respuesta_hablada = f"He encontrado {len(datos)} facturas que coinciden."
-            if not datos: respuesta_hablada = "No he encontrado facturas con esos criterios."
-
+            respuesta_hablada = f"He encontrado {len(datos)} facturas." if datos else "No he encontrado facturas con esos criterios."
         elif intent == 'resumen_mensual':
-            datos = db.get_monthly_summary()
-            respuesta_hablada = "Aquí está el resumen de tus gastos en los últimos meses."
-        
+            datos = db.get_monthly_summary(); respuesta_hablada = "Aquí está el resumen de tus gastos."
         elif intent == 'predecir_gastos':
             summary_data = db.get_monthly_summary()
-            if not summary_data:
-                respuesta_hablada = "No tengo suficientes datos para hacer una predicción."
+            if not summary_data: respuesta_hablada = "No tengo suficientes datos para hacer una predicción."
             else:
                 prompt_prediccion = f"Basado en estos datos de gastos (mes:gasto): {json.dumps(summary_data)}. Estima el gasto del próximo mes. Justifica tu respuesta en una o dos frases amigables."
                 prediction_response = gemini_model.generate_content(prompt_prediccion)
                 respuesta_hablada = prediction_response.text
-            
         elif intent == 'pregunta_general':
              respuesta_hablada = gemini_model.generate_content(text).text
 
         return jsonify({"ok": True, "respuesta_hablada": respuesta_hablada, "datos": datos, "intencion": intent})
-        
     except Exception as e:
-        return jsonify({"ok": False, "respuesta_hablada": "Ha ocurrido un error en mi cerebro de IA. Inténtalo de nuevo."})
+        return jsonify({"ok": False, "respuesta_hablada": "Ha ocurrido un error en mi cerebro de IA."})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
