@@ -1,4 +1,4 @@
-# database.py - VERSIÓN CON MÓDULO DE INTELIGENCIA
+# database.py - VERSIÓN ROBUSTA CONTRA DATOS NULOS DE LA IA
 
 import sqlite3
 import json
@@ -14,20 +14,51 @@ def init_db():
 def add_invoice(invoice_data: dict, ia_model: str):
     try:
         conn = sqlite3.connect(DATABASE_FILE); cursor = conn.cursor()
+        
+        # --- >>> CORRECCIÓN DE ROBUSTEZ AQUÍ <<< ---
+        # Nos aseguramos de que los valores numéricos sean válidos o se conviertan en 0.0 si son None.
+        total = invoice_data.get('total')
+        base_imponible = invoice_data.get('base_imponible')
+        
+        try:
+            total_float = float(total) if total is not None else 0.0
+        except (ValueError, TypeError):
+            total_float = 0.0
+
+        try:
+            base_imponible_float = float(base_imponible) if base_imponible is not None else 0.0
+        except (ValueError, TypeError):
+            base_imponible_float = 0.0
+
         cursor.execute('INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model) VALUES (?, ?, ?, ?, ?, ?, ?)', (
-            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'), invoice_data.get('total'),
-            invoice_data.get('base_imponible'), json.dumps(invoice_data.get('impuestos')), ia_model
+            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'), 
+            total_float, base_imponible_float, 
+            json.dumps(invoice_data.get('impuestos')), ia_model
         ))
+        
         factura_id = cursor.lastrowid
         conceptos_list = invoice_data.get('conceptos', [])
+        
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
+                # También hacemos robustos los campos de los conceptos
+                cantidad = concepto.get('cantidad')
+                precio_unitario = concepto.get('precio_unitario')
+                try:
+                    cantidad_float = float(cantidad) if cantidad is not None else 0.0
+                except (ValueError, TypeError):
+                    cantidad_float = 0.0
+                try:
+                    precio_float = float(precio_unitario) if precio_unitario is not None else 0.0
+                except (ValueError, TypeError):
+                    precio_float = 0.0
+                
                 cursor.execute('INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario) VALUES (?, ?, ?, ?)', (
-                    factura_id, concepto.get('descripcion'), concepto.get('cantidad'), concepto.get('precio_unitario')
+                    factura_id, concepto.get('descripcion'), cantidad_float, precio_float
                 ))
         conn.commit(); conn.close(); return factura_id
     except Exception as e:
-        print(f"Error al guardar en DB: {e}"); return None
+        print(f"Error CRÍTICO al guardar en DB: {e}"); return None
 
 def get_all_invoices():
     conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
@@ -45,7 +76,6 @@ def get_invoice_details(invoice_id: int):
     if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
     conn.close(); return invoice_details
 
-# --- >>> NUEVA FUNCIÓN PARA DAR CONTEXTO A GEMINI <<< ---
 def get_all_invoices_with_details():
     """
     Obtiene todas las facturas con sus conceptos para proporcionarlas como contexto a la IA.
