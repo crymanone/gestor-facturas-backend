@@ -1,10 +1,8 @@
-# database.py - VERSIÓN COMPLETA CON BÚSQUEDA INTELIGENTE
+# database.py - VERSIÓN CON MÓDULO DE INTELIGENCIA
 
 import sqlite3
 import json
-from datetime import datetime
 
-# Vercel solo permite escribir en /tmp
 DATABASE_FILE = '/tmp/facturas.db'
 
 def init_db():
@@ -22,7 +20,7 @@ def add_invoice(invoice_data: dict, ia_model: str):
         ))
         factura_id = cursor.lastrowid
         conceptos_list = invoice_data.get('conceptos', [])
-        if conceptos_list:
+        if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
                 cursor.execute('INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario) VALUES (?, ?, ?, ?)', (
                     factura_id, concepto.get('descripcion'), concepto.get('cantidad'), concepto.get('precio_unitario')
@@ -42,27 +40,40 @@ def get_invoice_details(invoice_id: int):
     if not invoice: return None
     cursor.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = ?', (invoice_id,)); conceptos = [dict(row) for row in cursor.fetchall()]
     invoice_details = dict(invoice); invoice_details['conceptos'] = conceptos
-    try: invoice_details['impuestos'] = json.loads(invoice_details['impuestos_json'])
-    except: invoice_details['impuestos'] = {}; del invoice_details['impuestos_json']
+    try: invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json', '{}'))
+    except (json.JSONDecodeError, TypeError): invoice_details['impuestos'] = {}
+    if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
     conn.close(); return invoice_details
 
-# --- >>> NUEVAS FUNCIONES PARA EL ASISTENTE DE IA <<< ---
-def search_invoices(filters: dict):
-    conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    query = 'SELECT id, emisor, fecha, total FROM facturas WHERE 1=1'; params = []
+# --- >>> NUEVA FUNCIÓN PARA DAR CONTEXTO A GEMINI <<< ---
+def get_all_invoices_with_details():
+    """
+    Obtiene todas las facturas con sus conceptos para proporcionarlas como contexto a la IA.
+    """
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
     
-    if filters.get('emisor'):
-        query += ' AND lower(emisor) LIKE ?'; params.append(f"%{filters['emisor'].lower()}%")
+    cursor.execute('SELECT * FROM facturas ORDER BY fecha DESC')
+    facturas = cursor.fetchall()
+    
+    invoices_list = []
+    for factura_row in facturas:
+        invoice_details = dict(factura_row)
+        factura_id = invoice_details['id']
         
-    if filters.get('mes'):
-        # Extrae el mes de la fecha guardada como texto (YYYY-MM-DD o DD/MM/YYYY)
-        query += " AND substr(fecha, instr(fecha, '/') + 1, 2) = ?"; params.append(str(filters['mes']).zfill(2))
-    
-    query += " ORDER BY fecha DESC"
-    cursor.execute(query, params)
-    invoices = [dict(row) for row in cursor.fetchall()]; conn.close(); return invoices
-
-def get_monthly_summary():
-    conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    query = "SELECT substr(fecha, -4) || '-' || substr(fecha, -7, 2) as mes, SUM(total) as gasto_total FROM facturas GROUP BY mes ORDER BY mes DESC LIMIT 6;"
-    cursor.execute(query); summary = [dict(row) for row in cursor.fetchall()]; conn.close(); return summary
+        cursor.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = ?', (factura_id,))
+        conceptos = [dict(row) for row in cursor.fetchall()]
+        invoice_details['conceptos'] = conceptos
+        
+        try:
+            invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json', '{}'))
+        except (json.JSONDecodeError, TypeError):
+            invoice_details['impuestos'] = {}
+        if 'impuestos_json' in invoice_details:
+            del invoice_details['impuestos_json']
+            
+        invoices_list.append(invoice_details)
+        
+    conn.close()
+    return invoices_list
