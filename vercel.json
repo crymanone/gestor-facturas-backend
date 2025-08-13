@@ -1,18 +1,26 @@
 {
-    "version": 2,
     "builds": [
         {
             "src": "app.py",
             "use": "@vercel/python",
             "config": {
-                "maxLambdaSize": "50mb"
+                "maxLambdaSize": "100mb",
+                "runtime": "python3.12"
             }
         }
     ],
-    "rewrites": [
+    "routes": [
         {
-            "source": "/(.*)",
-            "destination": "/app.py"
+            "src": "/(.*)",
+            "dest": "app.py"
         }
-    ]
+    ],
+    "functions": {
+        "app.py": {
+            "includeFiles": [
+                "database.py",
+                "prompts.py"
+            ]
+        }
+    }
 }
