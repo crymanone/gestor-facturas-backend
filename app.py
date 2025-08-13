@@ -1,4 +1,4 @@
-# app.py - VERSIÓN FINAL CON ENDPOINT DE BÚSQUEDA
+# app.py - VERSIÓN FINAL CON SOPORTE PARA PDF
 
 import os
 import json
@@ -39,6 +39,15 @@ Si un campo no se puede encontrar o no es aplicable, devuélvelo como `null`.
 Si los conceptos son difíciles de desglosar, extrae al menos una descripción general como un único concepto.
 """
 
+prompt_pagina_pdf = """
+Actúa como un experto contable analizando una PÁGINA de una factura que podría tener varias páginas.
+La imagen que te paso es una de esas páginas. NO es la factura completa.
+Extrae TODOS los campos que puedas ver en ESTA PÁGINA. Los campos son:
+- emisor, cif, fecha, total, base_imponible, impuestos, conceptos.
+Devuelve la respuesta estrictamente en formato JSON. Si un campo no está en esta página, devuélvelo como `null`.
+Es CRÍTICO que extraigas todos los conceptos ('line items') que veas en esta página.
+"""
+
 @app.route('/api/process_invoice', methods=['POST'])
 def process_invoice():
     if not request.data:
@@ -52,7 +61,7 @@ def process_invoice():
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         extracted_data = json.loads(json_text)
         print("Datos extraídos (JSON):", json.dumps(extracted_data, indent=2, ensure_ascii=False))
-        invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash-latest (real)")
+        invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash-latest (image)")
         if invoice_id:
             return jsonify({"ok": True, "data": extracted_data})
         else:
@@ -62,6 +71,21 @@ def process_invoice():
         return jsonify({"ok": False, "error": f"La IA devolvió un formato de datos incorrecto."}), 500
     except Exception as e:
         print(f"Error INESPERADO en process_invoice: {e}")
+        return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
+
+@app.route('/api/process_pdf_page', methods=['POST'])
+def process_pdf_page():
+    if not request.data:
+        return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen de página"}), 400
+    try:
+        image_bytes = io.BytesIO(request.data)
+        img = Image.open(image_bytes)
+        response = gemini_model.generate_content([prompt_pagina_pdf, img])
+        json_text = response.text.replace('```json', '').replace('```', '').strip()
+        extracted_data = json.loads(json_text)
+        return jsonify({"ok": True, "data": extracted_data})
+    except Exception as e:
+        print(f"Error en process_pdf_page: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
@@ -77,7 +101,7 @@ def handle_invoices():
             invoice_data = request.get_json()
             if not invoice_data or not invoice_data.get('emisor'):
                 return jsonify({"ok": False, "error": "Datos inválidos o emisor faltante"}), 400
-            new_id = db.add_invoice(invoice_data, "Manual")
+            new_id = db.add_invoice(invoice_data, "Manual/PDF")
             if new_id:
                 return jsonify({"ok": True, "id": new_id, "message": "Factura añadida"}), 201
             else:
@@ -96,7 +120,6 @@ def get_invoice(invoice_id):
     except Exception as e:
         return jsonify({"error": f"Error del servidor: {e}"}), 500
 
-# --- >>> NUEVA RUTA PARA LA BÚSQUEDA AVANZADA <<< ---
 @app.route('/api/search', methods=['POST'])
 def search():
     try:
@@ -104,17 +127,14 @@ def search():
         text_query = data.get('text_query', None)
         date_from_raw = data.get('date_from', None)
         date_to_raw = data.get('date_to', None)
-        
         date_from = None
         if date_from_raw and len(date_from_raw) == 10:
             parts = date_from_raw.split('/')
             if len(parts) == 3: date_from = f"{parts[2]}-{parts[1]}-{parts[0]}"
-        
         date_to = None
         if date_to_raw and len(date_to_raw) == 10:
             parts = date_to_raw.split('/')
             if len(parts) == 3: date_to = f"{parts[2]}-{parts[1]}-{parts[0]}"
-
         results = db.search_invoices(text_query, date_from, date_to)
         return jsonify({"ok": True, "invoices": results})
     except Exception as e:
@@ -129,12 +149,12 @@ def ask_assistant():
     user_query = query_data['query']
     all_invoices = db.get_all_invoices_with_details()
     if not all_invoices:
-        return jsonify({"ok": True, "answer": "No tienes ninguna factura registrada todavía. Añade algunas para poder analizarlas."})
+        return jsonify({"ok": True, "answer": "No tienes ninguna factura registrada todavía."})
     try:
         invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False)
         prompt_contextual = f"""
         Actúa como un asistente experto en contabilidad y finanzas personales.
-        A continuación, te proporciono una lista completa de las facturas de un usuario en formato JSON.
+        A continuación, te proporciono una lista de las facturas de un usuario en formato JSON.
         Tu tarea es responder a la pregunta del usuario basándote únicamente en estos datos.
 
         DATOS DE LAS FACTURAS:
