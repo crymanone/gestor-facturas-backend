@@ -1,4 +1,4 @@
-# app.py - VERSIÓN FINAL CON SOPORTE PARA PDF
+# app.py - VERSIÓN FINAL CON PROCESAMIENTO DE PDF EN EL SERVIDOR
 
 import os
 import json
@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import google.generativeai as genai
 import database as db
+import fitz  # PyMuPDF
 
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -25,7 +26,6 @@ prompt_plantilla_factura = """
 Actúa como un experto contable especializado en la extracción de datos de documentos.
 Analiza la siguiente imagen de una factura o ticket.
 Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON, sin texto introductorio, explicaciones o marcado de código.
-
 Los campos a extraer son:
 - emisor (El nombre de la empresa o persona que emite la factura)
 - cif (El identificador fiscal: CIF, NIF, VAT ID, etc.)
@@ -34,7 +34,6 @@ Los campos a extraer son:
 - base_imponible (El subtotal antes de impuestos, como un número)
 - impuestos (Un objeto JSON con los diferentes tipos de impuesto y su valor. Ej: {"iva_21": 21.00, "otros_impuestos": 2.50})
 - conceptos (Una lista de objetos, donde cada objeto contiene 'descripcion', 'cantidad' y 'precio_unitario')
-
 Si un campo no se puede encontrar o no es aplicable, devuélvelo como `null`.
 Si los conceptos son difíciles de desglosar, extrae al menos una descripción general como un único concepto.
 """
@@ -47,6 +46,20 @@ Extrae TODOS los campos que puedas ver en ESTA PÁGINA. Los campos son:
 Devuelve la respuesta estrictamente en formato JSON. Si un campo no está en esta página, devuélvelo como `null`.
 Es CRÍTICO que extraigas todos los conceptos ('line items') que veas en esta página.
 """
+
+def combine_pdf_pages_data(pages_data):
+    """Combina los datos extraídos de varias páginas de un PDF."""
+    if not pages_data: return None
+    final_invoice = {"conceptos": []}
+    for page_data in pages_data:
+        for key, value in page_data.items():
+            if key == "conceptos" and isinstance(value, list):
+                final_invoice["conceptos"].extend(value)
+            elif final_invoice.get(key) is None and value is not None:
+                final_invoice[key] = value
+            elif key in ['total', 'base_imponible', 'fecha'] and value is not None:
+                final_invoice[key] = value
+    return final_invoice
 
 @app.route('/api/process_invoice', methods=['POST'])
 def process_invoice():
@@ -61,32 +74,53 @@ def process_invoice():
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         extracted_data = json.loads(json_text)
         print("Datos extraídos (JSON):", json.dumps(extracted_data, indent=2, ensure_ascii=False))
+        
+        # Guardamos usando la ruta POST de /api/invoices para reutilizar la lógica
         invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash-latest (image)")
         if invoice_id:
             return jsonify({"ok": True, "data": extracted_data})
         else:
-            return jsonify({"ok": False, "error": "Los datos extraídos no se pudieron guardar en la base de datos."}), 500
-    except json.JSONDecodeError as e:
-        print(f"Error de JSON: La respuesta de Gemini no era un JSON válido. {e}")
-        return jsonify({"ok": False, "error": f"La IA devolvió un formato de datos incorrecto."}), 500
+            return jsonify({"ok": False, "error": "Los datos de la imagen no se pudieron guardar."}), 500
+
     except Exception as e:
         print(f"Error INESPERADO en process_invoice: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
 
-@app.route('/api/process_pdf_page', methods=['POST'])
-def process_pdf_page():
+@app.route('/api/process_pdf', methods=['POST'])
+def process_pdf():
     if not request.data:
-        return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen de página"}), 400
+        return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
     try:
-        image_bytes = io.BytesIO(request.data)
-        img = Image.open(image_bytes)
-        response = gemini_model.generate_content([prompt_pagina_pdf, img])
-        json_text = response.text.replace('```json', '').replace('```', '').strip()
-        extracted_data = json.loads(json_text)
-        return jsonify({"ok": True, "data": extracted_data})
+        pdf_bytes = request.data
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if len(doc) == 0:
+            return jsonify({"ok": False, "error": "El PDF está vacío."}), 400
+
+        pdf_pages_data = []
+        for i, page in enumerate(doc):
+            print(f"Procesando página {i+1}/{len(doc)} del PDF...")
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("jpeg")
+            img = Image.open(io.BytesIO(img_bytes))
+            response = gemini_model.generate_content([prompt_pagina_pdf, img])
+            json_text = response.text.replace('```json', '').replace('```', '').strip()
+            extracted_data = json.loads(json_text)
+            pdf_pages_data.append(extracted_data)
+
+        print("Combinando resultados de las páginas del PDF...")
+        final_invoice_data = combine_pdf_pages_data(pdf_pages_data)
+        if not final_invoice_data:
+            return jsonify({"ok": False, "error": "No se pudo extraer ningún dato del PDF."}), 500
+
+        print("Guardando factura extraída del PDF...")
+        invoice_id = db.add_invoice(final_invoice_data, "gemini-1.5-flash-latest (pdf)")
+        if invoice_id:
+            return jsonify({"ok": True, "data": final_invoice_data})
+        else:
+            return jsonify({"ok": False, "error": "Los datos del PDF no se pudieron guardar."}), 500
     except Exception as e:
-        print(f"Error en process_pdf_page: {e}")
-        return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
+        print(f"Error INESPERADO en process_pdf: {e}")
+        return jsonify({"ok": False, "error": f"Error del servidor al procesar PDF: {e}"}), 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
 def handle_invoices():
@@ -101,7 +135,7 @@ def handle_invoices():
             invoice_data = request.get_json()
             if not invoice_data or not invoice_data.get('emisor'):
                 return jsonify({"ok": False, "error": "Datos inválidos o emisor faltante"}), 400
-            new_id = db.add_invoice(invoice_data, "Manual/PDF")
+            new_id = db.add_invoice(invoice_data, "Manual")
             if new_id:
                 return jsonify({"ok": True, "id": new_id, "message": "Factura añadida"}), 201
             else:
