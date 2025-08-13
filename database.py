@@ -1,4 +1,4 @@
-# database.py - VERSIÓN ROBUSTA CONTRA DATOS NULOS DE LA IA
+# database.py - VERSIÓN FINAL CON BÚSQUEDA AVANZADA
 
 import sqlite3
 import json
@@ -14,48 +14,23 @@ def init_db():
 def add_invoice(invoice_data: dict, ia_model: str):
     try:
         conn = sqlite3.connect(DATABASE_FILE); cursor = conn.cursor()
-        
-        # --- >>> CORRECCIÓN DE ROBUSTEZ AQUÍ <<< ---
-        # Nos aseguramos de que los valores numéricos sean válidos o se conviertan en 0.0 si son None.
-        total = invoice_data.get('total')
-        base_imponible = invoice_data.get('base_imponible')
-        
-        try:
-            total_float = float(total) if total is not None else 0.0
-        except (ValueError, TypeError):
-            total_float = 0.0
-
-        try:
-            base_imponible_float = float(base_imponible) if base_imponible is not None else 0.0
-        except (ValueError, TypeError):
-            base_imponible_float = 0.0
-
+        total = invoice_data.get('total'); base_imponible = invoice_data.get('base_imponible')
+        try: total_float = float(total) if total is not None else 0.0
+        except (ValueError, TypeError): total_float = 0.0
+        try: base_imponible_float = float(base_imponible) if base_imponible is not None else 0.0
+        except (ValueError, TypeError): base_imponible_float = 0.0
         cursor.execute('INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model) VALUES (?, ?, ?, ?, ?, ?, ?)', (
-            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'), 
-            total_float, base_imponible_float, 
-            json.dumps(invoice_data.get('impuestos')), ia_model
-        ))
-        
+            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'), total_float, base_imponible_float, json.dumps(invoice_data.get('impuestos')), ia_model))
         factura_id = cursor.lastrowid
         conceptos_list = invoice_data.get('conceptos', [])
-        
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
-                # También hacemos robustos los campos de los conceptos
-                cantidad = concepto.get('cantidad')
-                precio_unitario = concepto.get('precio_unitario')
-                try:
-                    cantidad_float = float(cantidad) if cantidad is not None else 0.0
-                except (ValueError, TypeError):
-                    cantidad_float = 0.0
-                try:
-                    precio_float = float(precio_unitario) if precio_unitario is not None else 0.0
-                except (ValueError, TypeError):
-                    precio_float = 0.0
-                
-                cursor.execute('INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario) VALUES (?, ?, ?, ?)', (
-                    factura_id, concepto.get('descripcion'), cantidad_float, precio_float
-                ))
+                cantidad = concepto.get('cantidad'); precio_unitario = concepto.get('precio_unitario')
+                try: cantidad_float = float(cantidad) if cantidad is not None else 0.0
+                except (ValueError, TypeError): cantidad_float = 0.0
+                try: precio_float = float(precio_unitario) if precio_unitario is not None else 0.0
+                except (ValueError, TypeError): precio_float = 0.0
+                cursor.execute('INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario) VALUES (?, ?, ?, ?)', (factura_id, concepto.get('descripcion'), cantidad_float, precio_float))
         conn.commit(); conn.close(); return factura_id
     except Exception as e:
         print(f"Error CRÍTICO al guardar en DB: {e}"); return None
@@ -77,33 +52,51 @@ def get_invoice_details(invoice_id: int):
     conn.close(); return invoice_details
 
 def get_all_invoices_with_details():
-    """
-    Obtiene todas las facturas con sus conceptos para proporcionarlas como contexto a la IA.
-    """
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
+    conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
     cursor.execute('SELECT * FROM facturas ORDER BY fecha DESC')
     facturas = cursor.fetchall()
-    
     invoices_list = []
     for factura_row in facturas:
         invoice_details = dict(factura_row)
         factura_id = invoice_details['id']
-        
         cursor.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = ?', (factura_id,))
         conceptos = [dict(row) for row in cursor.fetchall()]
         invoice_details['conceptos'] = conceptos
-        
-        try:
-            invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json', '{}'))
-        except (json.JSONDecodeError, TypeError):
-            invoice_details['impuestos'] = {}
-        if 'impuestos_json' in invoice_details:
-            del invoice_details['impuestos_json']
-            
+        try: invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json', '{}'))
+        except (json.JSONDecodeError, TypeError): invoice_details['impuestos'] = {}
+        if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
         invoices_list.append(invoice_details)
-        
+    conn.close(); return invoices_list
+
+# --- >>> NUEVA FUNCIÓN DE BÚSQUEDA AVANZADA <<< ---
+def search_invoices(text_query=None, date_from=None, date_to=None):
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT DISTINCT f.id, f.emisor, f.fecha, f.total 
+    FROM facturas f
+    LEFT JOIN conceptos c ON f.id = c.factura_id
+    WHERE 1=1
+    """
+    params = []
+
+    if text_query:
+        query += " AND (LOWER(f.emisor) LIKE ? OR LOWER(c.descripcion) LIKE ?)"
+        params.extend([f'%{text_query.lower()}%', f'%{text_query.lower()}%'])
+
+    if date_from:
+        query += " AND SUBSTR(f.fecha, 7, 4) || '-' || SUBSTR(f.fecha, 4, 2) || '-' || SUBSTR(f.fecha, 1, 2) >= ?"
+        params.append(date_from)
+    
+    if date_to:
+        query += " AND SUBSTR(f.fecha, 7, 4) || '-' || SUBSTR(f.fecha, 4, 2) || '-' || SUBSTR(f.fecha, 1, 2) <= ?"
+        params.append(date_to)
+
+    query += " ORDER BY f.fecha DESC"
+    
+    cursor.execute(query, params)
+    results = [dict(row) for row in cursor.fetchall()]
     conn.close()
-    return invoices_list
+    return results

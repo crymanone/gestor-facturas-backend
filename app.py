@@ -1,4 +1,4 @@
-# app.py - VERSIÓN CON MEJORES LOGS DE DEPURACIÓN Y ROBUSTEZ
+# app.py - VERSIÓN FINAL CON ENDPOINT DE BÚSQUEDA
 
 import os
 import json
@@ -10,8 +10,7 @@ import database as db
 
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("No se encontró la GOOGLE_API_KEY en las variables de entorno.")
+    if not api_key: raise ValueError("No GOOGLE_API_KEY")
     genai.configure(api_key=api_key)
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
@@ -47,33 +46,21 @@ def process_invoice():
     try:
         image_bytes = io.BytesIO(request.data)
         img = Image.open(image_bytes)
-        
         print("Enviando imagen a Gemini...")
         response = gemini_model.generate_content([prompt_plantilla_factura, img])
-        
-        # --- MEJORA DE LOGS: Imprimimos la respuesta de Gemini ---
-        print("Respuesta de Gemini recibida:")
-        print(response.text)
-        
+        print("Respuesta de Gemini recibida:", response.text)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         extracted_data = json.loads(json_text)
-        
-        print("Datos extraídos (JSON):")
-        print(json.dumps(extracted_data, indent=2, ensure_ascii=False))
-        
+        print("Datos extraídos (JSON):", json.dumps(extracted_data, indent=2, ensure_ascii=False))
         invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash-latest (real)")
-        
         if invoice_id:
             return jsonify({"ok": True, "data": extracted_data})
         else:
-            # Si add_invoice devuelve None, es que hubo un error al guardar
             return jsonify({"ok": False, "error": "Los datos extraídos no se pudieron guardar en la base de datos."}), 500
-
     except json.JSONDecodeError as e:
         print(f"Error de JSON: La respuesta de Gemini no era un JSON válido. {e}")
         return jsonify({"ok": False, "error": f"La IA devolvió un formato de datos incorrecto."}), 500
     except Exception as e:
-        # MEJORA DE LOGS: Imprimimos el error específico
         print(f"Error INESPERADO en process_invoice: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
 
@@ -85,13 +72,11 @@ def handle_invoices():
             return jsonify({"ok": True, "invoices": invoices})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-    
     if request.method == 'POST':
         try:
             invoice_data = request.get_json()
             if not invoice_data or not invoice_data.get('emisor'):
                 return jsonify({"ok": False, "error": "Datos inválidos o emisor faltante"}), 400
-            
             new_id = db.add_invoice(invoice_data, "Manual")
             if new_id:
                 return jsonify({"ok": True, "id": new_id, "message": "Factura añadida"}), 201
@@ -111,22 +96,42 @@ def get_invoice(invoice_id):
     except Exception as e:
         return jsonify({"error": f"Error del servidor: {e}"}), 500
 
+# --- >>> NUEVA RUTA PARA LA BÚSQUEDA AVANZADA <<< ---
+@app.route('/api/search', methods=['POST'])
+def search():
+    try:
+        data = request.get_json()
+        text_query = data.get('text_query', None)
+        date_from_raw = data.get('date_from', None)
+        date_to_raw = data.get('date_to', None)
+        
+        date_from = None
+        if date_from_raw and len(date_from_raw) == 10:
+            parts = date_from_raw.split('/')
+            if len(parts) == 3: date_from = f"{parts[2]}-{parts[1]}-{parts[0]}"
+        
+        date_to = None
+        if date_to_raw and len(date_to_raw) == 10:
+            parts = date_to_raw.split('/')
+            if len(parts) == 3: date_to = f"{parts[2]}-{parts[1]}-{parts[0]}"
+
+        results = db.search_invoices(text_query, date_from, date_to)
+        return jsonify({"ok": True, "invoices": results})
+    except Exception as e:
+        print(f"Error en la búsqueda: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route('/api/ask', methods=['POST'])
 def ask_assistant():
     query_data = request.get_json()
     if not query_data or 'query' not in query_data:
         return jsonify({"ok": False, "error": "No se ha proporcionado ninguna pregunta."}), 400
-
     user_query = query_data['query']
-    
     all_invoices = db.get_all_invoices_with_details()
-
     if not all_invoices:
         return jsonify({"ok": True, "answer": "No tienes ninguna factura registrada todavía. Añade algunas para poder analizarlas."})
-
     try:
         invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False)
-
         prompt_contextual = f"""
         Actúa como un asistente experto en contabilidad y finanzas personales.
         A continuación, te proporciono una lista completa de las facturas de un usuario en formato JSON.
@@ -142,11 +147,8 @@ def ask_assistant():
 
         Proporciona una respuesta clara, concisa y directa. Si la pregunta no se puede responder con los datos proporcionados, indica amablemente que no tienes esa información. No inventes datos.
         """
-
         response = gemini_model.generate_content(prompt_contextual)
-        
         return jsonify({"ok": True, "answer": response.text})
-
     except Exception as e:
         print(f"Error al contactar con Gemini: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
