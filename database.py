@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON COLA DE PROCESAMIENTO
+# database.py - VERSIÓN FINAL Y COMPLETA CON COLA DE PROCESAMIENTO
 
 import os
 import psycopg2
@@ -56,14 +56,18 @@ def add_invoice(invoice_data: dict, ia_model: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
         impuestos = invoice_data.get('impuestos')
         impuestos_str = json.dumps(impuestos) if isinstance(impuestos, dict) else None
+        
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
             to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
             impuestos_str, ia_model
         ))
+        
         factura_id = cur.fetchone()[0]
+        
         conceptos_list = invoice_data.get('conceptos', [])
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
@@ -71,6 +75,7 @@ def add_invoice(invoice_data: dict, ia_model: str):
                     factura_id, concepto.get('descripcion'),
                     to_float(concepto.get('cantidad')), to_float(concepto.get('precio_unitario'))
                 ))
+        
         conn.commit()
         cur.close()
         return factura_id
@@ -122,13 +127,13 @@ def get_pending_pdf_job():
     finally:
         if conn: conn.close()
 
-def update_job_as_completed(job_id):
-    sql = "UPDATE pdf_processing_queue SET status = 'completed', pdf_data = NULL WHERE id = %s;" # Borramos el PDF para ahorrar espacio
+def update_job_as_completed(job_id, result_json):
+    sql = "UPDATE pdf_processing_queue SET status = 'completed', result_json = %s, pdf_data = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(sql, (job_id,))
+        cur.execute(sql, (json.dumps(result_json), job_id))
         conn.commit()
         cur.close()
     finally:
