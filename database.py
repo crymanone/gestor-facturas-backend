@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON SINTAXIS PostgreSQL CORREGIDA
+# database.py - VERSIÓN FINAL CON BORRADO DE FACTURAS
 
 import os
 import psycopg2
@@ -225,5 +225,24 @@ def search_invoices(text_query=None, date_from=None, date_to=None):
         results = [dict(row) for row in cur.fetchall()]
         cur.close()
         return results
+    finally:
+        if conn: conn.close()
+
+def delete_invoice(invoice_id: int):
+    sql_delete_conceptos = "DELETE FROM conceptos WHERE factura_id = %s;"
+    sql_delete_factura = "DELETE FROM facturas WHERE id = %s;"
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql_delete_conceptos, (invoice_id,))
+        cur.execute(sql_delete_factura, (invoice_id,))
+        conn.commit()
+        cur.close()
+        return True
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error al borrar la factura: {error}")
+        if conn: conn.rollback()
+        return False
     finally:
         if conn: conn.close()
