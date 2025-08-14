@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL Y COMPLETA CON COLA DE PROCESAMIENTO Y CORRECCIONES
+# database.py - VERSIÓN FINAL CON SINTAXIS PostgreSQL CORREGIDA
 
 import os
 import psycopg2
@@ -24,7 +24,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS pdf_processing_queue (
                 id UUID PRIMARY KEY,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
-                status TEXT NOT NULL, -- 'pending', 'processing', 'completed', 'failed'
+                status TEXT NOT NULL,
                 pdf_data BYTEA,
                 result_json JSONB,
                 error_message TEXT
@@ -56,18 +56,14 @@ def add_invoice(invoice_data: dict, ia_model: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
         impuestos = invoice_data.get('impuestos')
         impuestos_str = json.dumps(impuestos) if isinstance(impuestos, dict) else None
-        
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
             to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
             impuestos_str, ia_model
         ))
-        
         factura_id = cur.fetchone()[0]
-        
         conceptos_list = invoice_data.get('conceptos', [])
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
@@ -75,7 +71,6 @@ def add_invoice(invoice_data: dict, ia_model: str):
                     factura_id, concepto.get('descripcion'),
                     to_float(concepto.get('cantidad')), to_float(concepto.get('precio_unitario'))
                 ))
-        
         conn.commit()
         cur.close()
         return factura_id
