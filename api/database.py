@@ -1,78 +1,131 @@
-# database.py - VERSIÓN FINAL CON BÚSQUEDA AVANZADA
+# database.py - VERSIÓN FINAL CON SUPABASE (PostgreSQL)
 
-import sqlite3
+import os
+import psycopg2
+import psycopg2.extras # Para obtener resultados como diccionarios
 import json
 
-DATABASE_FILE = '/tmp/facturas.db'
+def get_db_connection():
+    """Crea una conexión a la base de datos de Supabase."""
+    conn_string = os.environ.get('DATABASE_URL')
+    if not conn_string:
+        raise ValueError("No se encontró la variable de entorno DATABASE_URL")
+    conn = psycopg2.connect(conn_string)
+    return conn
 
 def init_db():
-    conn = sqlite3.connect(DATABASE_FILE); cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS facturas (id INTEGER PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json TEXT, ia_model TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS conceptos (id INTEGER PRIMARY KEY, factura_id INTEGER, descripcion TEXT, cantidad REAL, precio_unitario REAL, FOREIGN KEY (factura_id) REFERENCES facturas (id))')
-    conn.commit(); conn.close(); print("Base de datos inicializada en", DATABASE_FILE)
+    """
+    Verifica la conexión. Las tablas se crean en la interfaz de Supabase.
+    """
+    try:
+        conn = get_db_connection()
+        print("Conexión con Supabase establecida correctamente.")
+        conn.close()
+    except Exception as e:
+        print(f"Error al conectar con Supabase: {e}")
 
 def add_invoice(invoice_data: dict, ia_model: str):
+    sql_factura = """
+    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model)
+    VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;
+    """
+    sql_concepto = """
+    INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario)
+    VALUES (%s, %s, %s, %s);
+    """
+    conn = None
     try:
-        conn = sqlite3.connect(DATABASE_FILE); cursor = conn.cursor()
-        total = invoice_data.get('total'); base_imponible = invoice_data.get('base_imponible')
-        try: total_float = float(total) if total is not None else 0.0
-        except (ValueError, TypeError): total_float = 0.0
-        try: base_imponible_float = float(base_imponible) if base_imponible is not None else 0.0
-        except (ValueError, TypeError): base_imponible_float = 0.0
-        cursor.execute('INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model) VALUES (?, ?, ?, ?, ?, ?, ?)', (
-            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'), total_float, base_imponible_float, json.dumps(invoice_data.get('impuestos')), ia_model))
-        factura_id = cursor.lastrowid
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        total = float(invoice_data.get('total') or 0.0)
+        base_imponible = float(invoice_data.get('base_imponible') or 0.0)
+        
+        cur.execute(sql_factura, (
+            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
+            total, base_imponible, json.dumps(invoice_data.get('impuestos')), ia_model
+        ))
+        
+        factura_id = cur.fetchone()[0]
+        
         conceptos_list = invoice_data.get('conceptos', [])
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
-                cantidad = concepto.get('cantidad'); precio_unitario = concepto.get('precio_unitario')
-                try: cantidad_float = float(cantidad) if cantidad is not None else 0.0
-                except (ValueError, TypeError): cantidad_float = 0.0
-                try: precio_float = float(precio_unitario) if precio_unitario is not None else 0.0
-                except (ValueError, TypeError): precio_float = 0.0
-                cursor.execute('INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario) VALUES (?, ?, ?, ?)', (factura_id, concepto.get('descripcion'), cantidad_float, precio_float))
-        conn.commit(); conn.close(); return factura_id
-    except Exception as e:
-        print(f"Error CRÍTICO al guardar en DB: {e}"); return None
+                cantidad = float(concepto.get('cantidad') or 0.0)
+                precio_unitario = float(concepto.get('precio_unitario') or 0.0)
+                cur.execute(sql_concepto, (
+                    factura_id, concepto.get('descripcion'), cantidad, precio_unitario
+                ))
+        
+        conn.commit()
+        cur.close()
+        return factura_id
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error en la transacción de la base de datos: {error}")
+        if conn: conn.rollback()
+        return None
+    finally:
+        if conn: conn.close()
 
 def get_all_invoices():
-    conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    cursor.execute('SELECT id, emisor, fecha, total FROM facturas ORDER BY fecha DESC')
-    invoices = [dict(row) for row in cursor.fetchall()]; conn.close(); return invoices
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute('SELECT id, emisor, fecha, total FROM facturas ORDER BY fecha DESC, id DESC')
+    invoices = [dict(row) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return invoices
 
 def get_invoice_details(invoice_id: int):
-    conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    cursor.execute('SELECT * FROM facturas WHERE id = ?', (invoice_id,)); invoice = cursor.fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    cur.execute('SELECT * FROM facturas WHERE id = %s', (invoice_id,));
+    invoice = cur.fetchone()
     if not invoice: return None
-    cursor.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = ?', (invoice_id,)); conceptos = [dict(row) for row in cursor.fetchall()]
-    invoice_details = dict(invoice); invoice_details['conceptos'] = conceptos
-    try: invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json', '{}'))
-    except (json.JSONDecodeError, TypeError): invoice_details['impuestos'] = {}
+    
+    cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s', (invoice_id,))
+    conceptos = [dict(row) for row in cur.fetchall()]
+    
+    invoice_details = dict(invoice)
+    invoice_details['conceptos'] = conceptos
+    
+    # El tipo jsonb de postgres ya devuelve un dict, no hace falta json.loads
+    invoice_details['impuestos'] = invoice_details.get('impuestos_json') or {}
     if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
-    conn.close(); return invoice_details
+
+    cur.close()
+    conn.close()
+    return invoice_details
 
 def get_all_invoices_with_details():
-    conn = sqlite3.connect(DATABASE_FILE); conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-    cursor.execute('SELECT * FROM facturas ORDER BY fecha DESC')
-    facturas = cursor.fetchall()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    cur.execute('SELECT * FROM facturas ORDER BY fecha DESC, id DESC')
+    facturas = cur.fetchall()
+    
     invoices_list = []
     for factura_row in facturas:
         invoice_details = dict(factura_row)
         factura_id = invoice_details['id']
-        cursor.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = ?', (factura_id,))
-        conceptos = [dict(row) for row in cursor.fetchall()]
+        
+        cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s', (factura_id,))
+        conceptos = [dict(row) for row in cur.fetchall()]
         invoice_details['conceptos'] = conceptos
-        try: invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json', '{}'))
-        except (json.JSONDecodeError, TypeError): invoice_details['impuestos'] = {}
+        
+        invoice_details['impuestos'] = invoice_details.get('impuestos_json') or {}
         if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
+            
         invoices_list.append(invoice_details)
-    conn.close(); return invoices_list
+        
+    cur.close()
+    conn.close()
+    return invoices_list
 
-# --- >>> NUEVA FUNCIÓN DE BÚSQUEDA AVANZADA <<< ---
 def search_invoices(text_query=None, date_from=None, date_to=None):
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     
     query = """
     SELECT DISTINCT f.id, f.emisor, f.fecha, f.total 
@@ -83,20 +136,22 @@ def search_invoices(text_query=None, date_from=None, date_to=None):
     params = []
 
     if text_query:
-        query += " AND (LOWER(f.emisor) LIKE ? OR LOWER(c.descripcion) LIKE ?)"
+        query += " AND (LOWER(f.emisor) LIKE %s OR LOWER(c.descripcion) LIKE %s)"
         params.extend([f'%{text_query.lower()}%', f'%{text_query.lower()}%'])
 
+    # Para PostgreSQL, es mejor castear a fecha
     if date_from:
-        query += " AND SUBSTR(f.fecha, 7, 4) || '-' || SUBSTR(f.fecha, 4, 2) || '-' || SUBSTR(f.fecha, 1, 2) >= ?"
-        params.append(date_from)
+        query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') >= %s"
+        params.append(date_from) # Espera formato AAAA-MM-DD
     
     if date_to:
-        query += " AND SUBSTR(f.fecha, 7, 4) || '-' || SUBSTR(f.fecha, 4, 2) || '-' || SUBSTR(f.fecha, 1, 2) <= ?"
-        params.append(date_to)
+        query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') <= %s"
+        params.append(date_to) # Espera formato AAAA-MM-DD
 
-    query += " ORDER BY f.fecha DESC"
+    query += " ORDER BY TO_DATE(f.fecha, 'DD/MM/YYYY') DESC, f.id DESC"
     
-    cursor.execute(query, params)
-    results = [dict(row) for row in cursor.fetchall()]
+    cur.execute(query, tuple(params))
+    results = [dict(row) for row in cur.fetchall()]
+    cur.close()
     conn.close()
     return results

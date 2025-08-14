@@ -1,4 +1,4 @@
-# app.py - VERSIÓN FINAL CON PROCESAMIENTO DE PDF EN EL SERVIDOR
+# app.py - VERSIÓN FINAL CON SUPABASE
 
 import os
 import json
@@ -6,8 +6,8 @@ import io
 from flask import Flask, request, jsonify
 from PIL import Image
 import google.generativeai as genai
-from . import database as db
-import fitz  # PyMuPDF
+from . import database as db # Importación relativa
+import fitz
 
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -17,8 +17,7 @@ except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
 app = Flask(__name__)
-db.DATABASE_FILE = '/tmp/facturas.db'
-db.init_db()
+db.init_db() # Solo verifica la conexión
 
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
@@ -48,7 +47,6 @@ Es CRÍTICO que extraigas todos los conceptos ('line items') que veas en esta p�
 """
 
 def combine_pdf_pages_data(pages_data):
-    """Combina los datos extraídos de varias páginas de un PDF."""
     if not pages_data: return None
     final_invoice = {"conceptos": []}
     for page_data in pages_data:
@@ -68,22 +66,15 @@ def process_invoice():
     try:
         image_bytes = io.BytesIO(request.data)
         img = Image.open(image_bytes)
-        print("Enviando imagen a Gemini...")
         response = gemini_model.generate_content([prompt_plantilla_factura, img])
-        print("Respuesta de Gemini recibida:", response.text)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         extracted_data = json.loads(json_text)
-        print("Datos extraídos (JSON):", json.dumps(extracted_data, indent=2, ensure_ascii=False))
-        
-        # Guardamos usando la ruta POST de /api/invoices para reutilizar la lógica
         invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash-latest (image)")
         if invoice_id:
-            return jsonify({"ok": True, "data": extracted_data})
+            return jsonify({"ok": True, "id": invoice_id})
         else:
             return jsonify({"ok": False, "error": "Los datos de la imagen no se pudieron guardar."}), 500
-
     except Exception as e:
-        print(f"Error INESPERADO en process_invoice: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
 
 @app.route('/api/process_pdf', methods=['POST'])
@@ -98,7 +89,6 @@ def process_pdf():
 
         pdf_pages_data = []
         for i, page in enumerate(doc):
-            print(f"Procesando página {i+1}/{len(doc)} del PDF...")
             pix = page.get_pixmap(dpi=200)
             img_bytes = pix.tobytes("jpeg")
             img = Image.open(io.BytesIO(img_bytes))
@@ -107,19 +97,16 @@ def process_pdf():
             extracted_data = json.loads(json_text)
             pdf_pages_data.append(extracted_data)
 
-        print("Combinando resultados de las páginas del PDF...")
         final_invoice_data = combine_pdf_pages_data(pdf_pages_data)
         if not final_invoice_data:
             return jsonify({"ok": False, "error": "No se pudo extraer ningún dato del PDF."}), 500
 
-        print("Guardando factura extraída del PDF...")
         invoice_id = db.add_invoice(final_invoice_data, "gemini-1.5-flash-latest (pdf)")
         if invoice_id:
-            return jsonify({"ok": True, "data": final_invoice_data})
+            return jsonify({"ok": True, "id": invoice_id})
         else:
             return jsonify({"ok": False, "error": "Los datos del PDF no se pudieron guardar."}), 500
     except Exception as e:
-        print(f"Error INESPERADO en process_pdf: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor al procesar PDF: {e}"}), 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
@@ -129,7 +116,7 @@ def handle_invoices():
             invoices = db.get_all_invoices()
             return jsonify({"ok": True, "invoices": invoices})
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"ok": False, "error": str(e)}), 500
     if request.method == 'POST':
         try:
             invoice_data = request.get_json()
@@ -141,7 +128,7 @@ def handle_invoices():
             else:
                 return jsonify({"ok": False, "error": "No se pudo guardar la factura"}), 500
         except Exception as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route('/api/invoice/<int:invoice_id>', methods=['GET'])
 def get_invoice(invoice_id):
@@ -152,7 +139,7 @@ def get_invoice(invoice_id):
         else:
             return jsonify({"ok": False, "error": "Factura no encontrada"}), 404
     except Exception as e:
-        return jsonify({"error": f"Error del servidor: {e}"}), 500
+        return jsonify({"ok": False, "error": f"Error del servidor: {e}"}), 500
 
 @app.route('/api/search', methods=['POST'])
 def search():
@@ -172,7 +159,6 @@ def search():
         results = db.search_invoices(text_query, date_from, date_to)
         return jsonify({"ok": True, "invoices": results})
     except Exception as e:
-        print(f"Error en la búsqueda: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route('/api/ask', methods=['POST'])
@@ -185,24 +171,13 @@ def ask_assistant():
     if not all_invoices:
         return jsonify({"ok": True, "answer": "No tienes ninguna factura registrada todavía."})
     try:
-        invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False)
+        invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False, default=str) # Añadido default=str por si hay fechas
         prompt_contextual = f"""
-        Actúa como un asistente experto en contabilidad y finanzas personales.
-        A continuación, te proporciono una lista de las facturas de un usuario en formato JSON.
-        Tu tarea es responder a la pregunta del usuario basándote únicamente en estos datos.
-
-        DATOS DE LAS FACTURAS:
-        ```json
-        {invoices_context}
-        ```
-
-        PREGUNTA DEL USUARIO:
-        "{user_query}"
-
-        Proporciona una respuesta clara, concisa y directa. Si la pregunta no se puede responder con los datos proporcionados, indica amablemente que no tienes esa información. No inventes datos.
+        Actúa como un asistente experto en contabilidad y finanzas personales...
+        PREGUNTA DEL USUARIO: "{user_query}"
+        ...
         """
         response = gemini_model.generate_content(prompt_contextual)
         return jsonify({"ok": True, "answer": response.text})
     except Exception as e:
-        print(f"Error al contactar con Gemini: {e}")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
