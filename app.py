@@ -6,7 +6,7 @@ import io
 from flask import Flask, request, jsonify
 from PIL import Image
 import google.generativeai as genai
-from import database as db # Importación relativa
+import database as db
 import fitz
 
 try:
