@@ -1,4 +1,4 @@
-# app.py - VERSIÓN FINAL CON PROCESAMIENTO EFICIENTE DE PDF EN UNA SOLA LLAMADA
+# app.py - VERSIÓN FINAL CON PROCESAMIENTO ASÍNCRONO REAL
 
 import os
 import json
@@ -6,7 +6,7 @@ import io
 from flask import Flask, request, jsonify
 from PIL import Image
 import google.generativeai as genai
-from . import database as db
+import database as db
 import fitz
 
 try:
@@ -23,11 +23,7 @@ gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
 prompt_plantilla_factura = """
 Actúa como un experto contable especializado en la extracción de datos de documentos.
-Analiza la siguiente imagen de una factura o ticket.
-Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON, sin texto introductorio, explicaciones o marcado de código.
-Los campos a extraer son:
-- emisor, cif, fecha, total, base_imponible, impuestos, conceptos.
-Si un campo no se puede encontrar o no es aplicable, devuélvelo como `null`.
+Analiza la siguiente imagen de una factura o ticket y extrae los campos en formato JSON.
 """
 
 prompt_multipagina_pdf = """
@@ -39,6 +35,19 @@ Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera apar
 Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
 """
 
+def combine_pdf_pages_data(pages_data):
+    if not pages_data: return None
+    final_invoice = {"conceptos": []}
+    for page_data in pages_data:
+        for key, value in page_data.items():
+            if key == "conceptos" and isinstance(value, list):
+                final_invoice["conceptos"].extend(value)
+            elif final_invoice.get(key) is None and value is not None:
+                final_invoice[key] = value
+            elif key in ['total', 'base_imponible', 'fecha'] and value is not None:
+                final_invoice[key] = value
+    return final_invoice
+
 @app.route('/api/process_invoice', methods=['POST'])
 def process_invoice():
     if not request.data:
@@ -49,53 +58,67 @@ def process_invoice():
         response = gemini_model.generate_content([prompt_plantilla_factura, img])
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         extracted_data = json.loads(json_text)
-        
-        print("--- INTENTANDO GUARDAR DATOS DE IMAGEN ---"); print(json.dumps(extracted_data, indent=2, ensure_ascii=False))
         invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash (image)")
-        
         if invoice_id:
-            print("--- DATOS GUARDADOS CON ÉXITO ---")
             return jsonify({"ok": True, "id": invoice_id})
         else:
-            print("--- FALLO AL GUARDAR EN DB ---")
             return jsonify({"ok": False, "error": "Los datos de la imagen no se pudieron guardar."}), 500
     except Exception as e:
-        print(f"--- ERROR INESPERADO EN process_invoice: {e} ---")
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
 
-@app.route('/api/process_pdf', methods=['POST'])
-def process_pdf():
+@app.route('/api/upload_pdf', methods=['POST'])
+def upload_pdf():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
-    try:
-        pdf_bytes = request.data
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        if len(doc) == 0:
-            return jsonify({"ok": False, "error": "El PDF está vacío."}), 400
+    pdf_bytes = request.data
+    job_id = db.create_pdf_job(pdf_bytes)
+    if job_id:
+        return jsonify({"ok": True, "job_id": job_id})
+    else:
+        return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento."}), 500
 
+@app.route('/api/job_status/<job_id>', methods=['GET'])
+def job_status(job_id):
+    status = db.get_job_status(job_id)
+    if status:
+        return jsonify({"ok": True, "status": status})
+    else:
+        return jsonify({"ok": False, "error": "Job ID no encontrado."}), 404
+
+@app.route('/api/process_queue', methods=['GET'])
+def process_queue():
+    job = db.get_pending_pdf_job()
+    if not job:
+        return "No pending jobs found.", 200
+
+    job_id = job['id']
+    pdf_bytes = job['pdf_data']
+    try:
+        doc = fitz.open(stream=bytes(pdf_bytes), filetype="pdf")
+        if not len(doc):
+            raise ValueError("El PDF en la cola está vacío.")
         image_parts = []
         for page in doc:
             pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("jpeg")
-            img = Image.open(io.BytesIO(img_bytes))
+            img_bytes_page = pix.tobytes("jpeg")
+            img = Image.open(io.BytesIO(img_bytes_page))
             image_parts.append(img)
         
         response = gemini_model.generate_content([prompt_multipagina_pdf] + image_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
-        extracted_data = json.loads(json_text)
+        final_invoice_data = json.loads(json_text)
+        invoice_id = db.add_invoice(final_invoice_data, "gemini-1.5-flash (pdf)")
         
-        print("--- INTENTANDO GUARDAR DATOS DE PDF ---"); print(json.dumps(extracted_data, indent=2, ensure_ascii=False))
-        invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash (pdf)")
+        if not invoice_id:
+            raise ValueError("Falló el guardado en la tabla de facturas.")
+        
+        db.update_job_as_completed(job_id)
+        return f"Job {job_id} processed successfully.", 200
 
-        if invoice_id:
-            print("--- DATOS GUARDADOS CON ÉXITO ---")
-            return jsonify({"ok": True, "id": invoice_id})
-        else:
-            print("--- FALLO AL GUARDAR EN DB ---")
-            return jsonify({"ok": False, "error": "Los datos del PDF no se pudieron guardar."}), 500
     except Exception as e:
-        print(f"--- ERROR INESPERADO en process_pdf: {e} ---")
-        return jsonify({"ok": False, "error": f"Error del servidor al procesar PDF: {e}"}), 500
+        print(f"Error processing job {job_id}: {e}")
+        db.update_job_as_failed(job_id, str(e))
+        return f"Failed to process job {job_id}.", 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
 def handle_invoices():
@@ -161,9 +184,19 @@ def ask_assistant():
     try:
         invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False, default=str)
         prompt_contextual = f"""
-        Actúa como un asistente experto en contabilidad y finanzas personales...
-        PREGUNTA DEL USUARIO: "{user_query}"
-        ...
+        Actúa como un asistente experto en contabilidad y finanzas personales.
+        A continuación, te proporciono una lista de las facturas de un usuario en formato JSON.
+        Tu tarea es responder a la pregunta del usuario basándote únicamente en estos datos.
+
+        DATOS DE LAS FACTURAS:
+        ```json
+        {invoices_context}
+        ```
+
+        PREGUNTA DEL USUARIO:
+        "{user_query}"
+
+        Proporciona una respuesta clara, concisa y directa. Si la pregunta no se puede responder con los datos proporcionados, indica amablemente que no tienes esa información. No inventes datos.
         """
         response = gemini_model.generate_content(prompt_contextual)
         return jsonify({"ok": True, "answer": response.text})
