@@ -1,30 +1,32 @@
-# database.py - VERSIÓN FINAL CON MEJORAS DE CONEXIÓN PARA SUPABASE
+# database.py - VERSIÓN FINAL CON SOPORTE ASÍNCRONO
 
 import os
 import psycopg2
 import psycopg2.extras
 import json
+import uuid
 
 def get_db_connection():
-    """
-    Crea una conexión a la base de datos de Supabase usando la variable de entorno.
-    Añade un timeout para evitar que la función se quede colgada.
-    """
     conn_string = os.environ.get('DATABASE_URL')
     if not conn_string:
         raise ValueError("No se encontró la variable de entorno DATABASE_URL")
-    
-    # Buena práctica: añadir un timeout a la conexión
     conn = psycopg2.connect(conn_string, connect_timeout=10)
     return conn
 
 def init_db():
+    conn = None
     try:
         conn = get_db_connection()
-        print("Conexión con Supabase establecida correctamente.")
-        conn.close()
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE IF NOT EXISTS facturas (id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json JSONB, ia_model TEXT, created_at TIMESTAMPTZ DEFAULT NOW())')
+        cur.execute('CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL)')
+        conn.commit()
+        cur.close()
+        print("Base de datos y tablas listas.")
     except Exception as e:
-        print(f"Error al conectar con Supabase: {e}")
+        print(f"Error al inicializar la base de datos: {e}")
+    finally:
+        if conn: conn.close()
 
 def to_float(value):
     if value is None: return 0.0
@@ -42,7 +44,6 @@ def add_invoice(invoice_data: dict, ia_model: str):
     """
     conn = None
     try:
-        # Buena práctica: Abrir la conexión justo antes de usarla
         conn = get_db_connection()
         cur = conn.cursor()
         
@@ -73,7 +74,6 @@ def add_invoice(invoice_data: dict, ia_model: str):
         if conn: conn.rollback()
         return None
     finally:
-        # Buena práctica: Asegurarse de cerrar siempre la conexión
         if conn: conn.close()
 
 def get_all_invoices():
