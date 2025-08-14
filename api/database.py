@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON SUPABASE (PostgreSQL)
+# database.py - VERSIÓN FINAL CON CORRECCIÓN DE TIPOS DE DATOS PARA SUPABASE
 
 import os
 import psycopg2
@@ -14,9 +14,7 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """
-    Verifica la conexión. Las tablas se crean en la interfaz de Supabase.
-    """
+    """Verifica la conexión. Las tablas se crean en la interfaz de Supabase."""
     try:
         conn = get_db_connection()
         print("Conexión con Supabase establecida correctamente.")
@@ -37,9 +35,15 @@ def add_invoice(invoice_data: dict, ia_model: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        total = float(invoice_data.get('total') or 0.0)
-        base_imponible = float(invoice_data.get('base_imponible') or 0.0)
+
+        # --- >>> CORRECCIÓN DE ROBUSTEZ Y TIPOS DE DATOS AQUÍ <<< ---
+        def to_float(value):
+            if value is None: return 0.0
+            try: return float(value)
+            except (ValueError, TypeError): return 0.0
+
+        total = to_float(invoice_data.get('total'))
+        base_imponible = to_float(invoice_data.get('base_imponible'))
         
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
@@ -51,8 +55,8 @@ def add_invoice(invoice_data: dict, ia_model: str):
         conceptos_list = invoice_data.get('conceptos', [])
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
-                cantidad = float(concepto.get('cantidad') or 0.0)
-                precio_unitario = float(concepto.get('precio_unitario') or 0.0)
+                cantidad = to_float(concepto.get('cantidad'))
+                precio_unitario = to_float(concepto.get('precio_unitario'))
                 cur.execute(sql_concepto, (
                     factura_id, concepto.get('descripcion'), cantidad, precio_unitario
                 ))
@@ -90,7 +94,6 @@ def get_invoice_details(invoice_id: int):
     invoice_details = dict(invoice)
     invoice_details['conceptos'] = conceptos
     
-    # El tipo jsonb de postgres ya devuelve un dict, no hace falta json.loads
     invoice_details['impuestos'] = invoice_details.get('impuestos_json') or {}
     if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
 
@@ -139,14 +142,14 @@ def search_invoices(text_query=None, date_from=None, date_to=None):
         query += " AND (LOWER(f.emisor) LIKE %s OR LOWER(c.descripcion) LIKE %s)"
         params.extend([f'%{text_query.lower()}%', f'%{text_query.lower()}%'])
 
-    # Para PostgreSQL, es mejor castear a fecha
     if date_from:
-        query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') >= %s"
-        params.append(date_from) # Espera formato AAAA-MM-DD
+        # Usamos TO_DATE para convertir el texto a una fecha real para comparar
+        query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') >= TO_DATE(%s, 'YYYY-MM-DD')"
+        params.append(date_from)
     
     if date_to:
-        query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') <= %s"
-        params.append(date_to) # Espera formato AAAA-MM-DD
+        query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') <= TO_DATE(%s, 'YYYY-MM-DD')"
+        params.append(date_to)
 
     query += " ORDER BY TO_DATE(f.fecha, 'DD/MM/YYYY') DESC, f.id DESC"
     
