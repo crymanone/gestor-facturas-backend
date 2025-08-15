@@ -10,3 +10,11 @@
         { "src": "/(.*)", "dest": "app.py" }
     ]
 }
+{
+  "crons": [
+    {
+      "path": "/api/process_queue",
+      "schedule": "* * * * *"
+    }
+  ]
+}
