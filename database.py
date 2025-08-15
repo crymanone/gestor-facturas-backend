@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON BORRADO DE FACTURAS
+# database.py - VERSIÓN COMPLETA CON CORRECCIÓN DE ADAPTACIÓN DE TIPO UUID
 
 import os
 import psycopg2
@@ -101,7 +101,8 @@ def get_job_status(job_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql, (uuid.UUID(job_id),))
+        # <<< --- CORRECCIÓN CRÍTICA --- >>>
+        cur.execute(sql, (str(uuid.UUID(job_id)),))
         job = cur.fetchone()
         cur.close()
         return dict(job) if job else None
