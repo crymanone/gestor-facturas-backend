@@ -98,9 +98,24 @@ def job_status(job_id):
 
 @app.route('/api/process_queue', methods=['GET'])
 def process_queue():
+    # --- >> SEGURIDAD AÑADIDA << ---
+    try:
+        auth_header = request.headers.get('Authorization')
+        cron_secret = os.environ.get('CRON_SECRET')
+        # Vercel añade el CRON_SECRET como 'Bearer <tu_secreto>'
+        if not cron_secret or auth_header != f'Bearer {cron_secret}':
+            print("Acceso no autorizado a process_queue.") # Log para depuración
+            return "Unauthorized", 401
+    except Exception as e:
+        print(f"Error de autorización: {e}")
+        return "Authorization Error", 403
+    # --- >> FIN DE SEGURIDAD << ---
+
+    # El resto de la función sigue exactamente igual
     job = db.get_pending_pdf_job()
     if not job:
         return "No pending jobs found.", 200
+    
     job_id = job['id']
     pdf_bytes = job['pdf_data']
     try:
