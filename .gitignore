@@ -1,0 +1,5 @@
+# Escribe o crea un archivo llamado .gitignore
+# y añade estas dos líneas dentro para decirle a Git
+# que ignore todos los archivos .json y .txt
+echo "*.json" >> .gitignore
+echo "*.txt" >> .gitignore

@@ -1,5 +1,6 @@
 Flask
-Pillow
-google-generativeai
-PyMuPDF
 psycopg2-binary
+google-generativeai
+Pillow
+PyMuPDF
+firebase-admin

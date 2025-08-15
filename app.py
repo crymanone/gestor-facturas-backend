@@ -1,13 +1,34 @@
-# app.py - VERSIÓN FINAL CON ENDPOINT DE BORRADO
+# app.py - VERSIÓN COMPLETA CON AUTENTICACIÓN FIREBASE
 
 import os
 import json
 import io
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
+from functools import wraps
 from PIL import Image
 import google.generativeai as genai
 import database as db
 import fitz
+
+# --- NUEVO: INICIALIZACIÓN DE FIREBASE ADMIN ---
+import firebase_admin
+from firebase_admin import credentials, auth
+
+try:
+    firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
+    if not firebase_sdk_json_str:
+        raise ValueError("La variable de entorno FIREBASE_ADMIN_SDK_JSON no está configurada.")
+    
+    cred_json = json.loads(firebase_sdk_json_str)
+    cred = credentials.Certificate(cred_json)
+    
+    # Prevenimos la reinicialización si el código se recarga (común en entornos de desarrollo)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
+    print("Firebase Admin SDK inicializado correctamente.")
+except Exception as e:
+    print(f"ERROR CRÍTICO al inicializar Firebase: {e}")
+# --- FIN DE INICIALIZACIÓN ---
 
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -20,6 +41,33 @@ app = Flask(__name__)
 db.init_db()
 
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+
+# --- NUEVO: DECORADOR DE AUTENTICACIÓN ---
+def check_token(f):
+    @wraps(f)
+    def wrap(*args,**kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'ok': False, 'error': 'No se proveyó un token Bearer'}), 401
+        
+        try:
+            token = auth_header.split('Bearer ')[1]
+            decoded_token = auth.verify_id_token(token)
+            # Guardamos el user_id en el objeto global 'g' de Flask
+            # para que esté disponible durante la vida de esta petición
+            g.user_id = decoded_token['uid']
+        except auth.ExpiredIdTokenError:
+            return jsonify({'ok': False, 'error': 'El token ha expirado'}), 403
+        except auth.InvalidIdTokenError as e:
+            print(f"Error de token inválido: {e}")
+            return jsonify({'ok': False, 'error': 'Token inválido'}), 403
+        except Exception as e:
+            print(f"Error de token inesperado: {e}")
+            return jsonify({'ok': False, 'error': 'Error de autenticación'}), 403
+        
+        return f(*args, **kwargs)
+    return wrap
+# --- FIN DE DECORADOR ---
 
 prompt_plantilla_factura = """
 Actúa como un experto contable especializado en la extracción de datos de documentos.
@@ -46,20 +94,8 @@ Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera apar
 Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
 """
 
-def combine_pdf_pages_data(pages_data):
-    if not pages_data: return None
-    final_invoice = {"conceptos": []}
-    for page_data in pages_data:
-        for key, value in page_data.items():
-            if key == "conceptos" and isinstance(value, list):
-                final_invoice["conceptos"].extend(value)
-            elif final_invoice.get(key) is None and value is not None:
-                final_invoice[key] = value
-            elif key in ['total', 'base_imponible', 'fecha'] and value is not None:
-                final_invoice[key] = value
-    return final_invoice
-
 @app.route('/api/process_invoice', methods=['POST'])
+@check_token
 def process_invoice():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen"}), 400
@@ -69,7 +105,7 @@ def process_invoice():
         response = gemini_model.generate_content([prompt_plantilla_factura, img])
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         extracted_data = json.loads(json_text)
-        invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash (image)")
+        invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash (image)", g.user_id)
         if invoice_id:
             return jsonify({"ok": True, "id": invoice_id})
         else:
@@ -78,11 +114,12 @@ def process_invoice():
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
 
 @app.route('/api/upload_pdf', methods=['POST'])
+@check_token
 def upload_pdf():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
     pdf_bytes = request.data
-    job_id = db.create_pdf_job(pdf_bytes)
+    job_id = db.create_pdf_job(pdf_bytes, g.user_id)
     if job_id:
         return jsonify({"ok": True, "job_id": job_id})
     else:
@@ -98,43 +135,47 @@ def job_status(job_id):
 
 @app.route('/api/process_queue', methods=['GET'])
 def process_queue():
-    # --- >> SEGURIDAD AÑADIDA << ---
-    try:
-        auth_header = request.headers.get('Authorization')
-        cron_secret = os.environ.get('CRON_SECRET')
-        # Vercel añade el CRON_SECRET como 'Bearer <tu_secreto>'
-        if not cron_secret or auth_header != f'Bearer {cron_secret}':
-            print("Acceso no autorizado a process_queue.") # Log para depuración
-            return "Unauthorized", 401
-    except Exception as e:
-        print(f"Error de autorización: {e}")
-        return "Authorization Error", 403
-    # --- >> FIN DE SEGURIDAD << ---
+    auth_header = request.headers.get('Authorization')
+    cron_secret = os.environ.get('CRON_SECRET')
+    if not cron_secret or auth_header != f"Bearer {cron_secret}":
+        print("Acceso no autorizado a process_queue.") # Log para depuración
+        return "Unauthorized", 401
 
-    # El resto de la función sigue exactamente igual
     job = db.get_pending_pdf_job()
     if not job:
-        return "No pending jobs found.", 200
+        return "No hay trabajos pendientes.", 200
     
     job_id = job['id']
     pdf_bytes = job['pdf_data']
+    
+    result_json_before = job.get('result_json', {})
+    user_id_for_job = result_json_before.get('user_id') if isinstance(result_json_before, dict) else None
+
+    if not user_id_for_job:
+        db.update_job_as_failed(job['id'], "No user_id found in job metadata")
+        print(f"Fallo en job {job_id}: no se encontró user_id.")
+        return "Fallo, job sin user_id", 500
+
     try:
         doc = fitz.open(stream=bytes(pdf_bytes), filetype="pdf")
-        if not len(doc):
-            raise ValueError("El PDF en la cola está vacío.")
+        if not len(doc): raise ValueError("El PDF en la cola está vacío.")
         image_parts = []
         for page in doc:
             pix = page.get_pixmap(dpi=200)
             img_bytes_page = pix.tobytes("jpeg")
             img = Image.open(io.BytesIO(img_bytes_page))
             image_parts.append(img)
+        
         response = gemini_model.generate_content([prompt_multipagina_pdf] + image_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         final_invoice_data = json.loads(json_text)
-        invoice_id = db.add_invoice(final_invoice_data, "gemini-1.5-flash (pdf)")
+        
+        invoice_id = db.add_invoice(final_invoice_data, "gemini-1.5-flash (pdf)", user_id_for_job)
         if not invoice_id:
             raise ValueError("Falló el guardado en la tabla de facturas.")
+        
         db.update_job_as_completed(job_id, final_invoice_data)
+        print(f"Job {job_id} procesado para usuario {user_id_for_job}.")
         return f"Job {job_id} processed successfully.", 200
     except Exception as e:
         print(f"Error processing job {job_id}: {e}")
@@ -142,10 +183,11 @@ def process_queue():
         return f"Failed to process job {job_id}.", 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
+@check_token
 def handle_invoices():
     if request.method == 'GET':
         try:
-            invoices = db.get_all_invoices()
+            invoices = db.get_all_invoices(g.user_id)
             return jsonify({"ok": True, "invoices": invoices})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
@@ -154,7 +196,7 @@ def handle_invoices():
             invoice_data = request.get_json()
             if not invoice_data or not invoice_data.get('emisor'):
                 return jsonify({"ok": False, "error": "Datos inválidos o emisor faltante"}), 400
-            new_id = db.add_invoice(invoice_data, "Manual")
+            new_id = db.add_invoice(invoice_data, "Manual", g.user_id)
             if new_id:
                 return jsonify({"ok": True, "id": new_id}), 201
             else:
@@ -163,27 +205,30 @@ def handle_invoices():
             return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route('/api/invoice/<int:invoice_id>', methods=['GET', 'DELETE'])
+@check_token
 def handle_single_invoice(invoice_id):
     if request.method == 'GET':
         try:
-            details = db.get_invoice_details(invoice_id)
+            details = db.get_invoice_details(invoice_id, g.user_id)
             if details:
                 return jsonify({"ok": True, "invoice": details})
             else:
                 return jsonify({"ok": False, "error": "Factura no encontrada"}), 404
         except Exception as e:
             return jsonify({"ok": False, "error": f"Error del servidor: {e}"}), 500
+            
     if request.method == 'DELETE':
         try:
-            success = db.delete_invoice(invoice_id)
+            success = db.delete_invoice(invoice_id, g.user_id)
             if success:
                 return jsonify({"ok": True, "message": "Factura borrada correctamente"})
             else:
-                return jsonify({"ok": False, "error": "No se pudo borrar la factura"}), 500
+                return jsonify({"ok": False, "error": "No se pudo borrar la factura o no te pertenece"}), 404
         except Exception as e:
             return jsonify({"ok": False, "error": f"Error del servidor: {e}"}), 500
 
 @app.route('/api/search', methods=['POST'])
+@check_token
 def search():
     try:
         data = request.get_json()
@@ -198,20 +243,24 @@ def search():
         if date_to_raw and len(date_to_raw) == 10:
             parts = date_to_raw.split('/')
             if len(parts) == 3: date_to = f"{parts[2]}-{parts[1]}-{parts[0]}"
-        results = db.search_invoices(text_query, date_from, date_to)
+            
+        results = db.search_invoices(g.user_id, text_query, date_from, date_to)
         return jsonify({"ok": True, "invoices": results})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route('/api/ask', methods=['POST'])
+@check_token
 def ask_assistant():
     query_data = request.get_json()
     if not query_data or 'query' not in query_data:
         return jsonify({"ok": False, "error": "No se ha proporcionado ninguna pregunta."}), 400
+        
     user_query = query_data['query']
-    all_invoices = db.get_all_invoices_with_details()
+    all_invoices = db.get_all_invoices_with_details(g.user_id)
     if not all_invoices:
         return jsonify({"ok": True, "answer": "No tienes ninguna factura registrada todavía."})
+        
     try:
         invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False, default=str)
         prompt_contextual = f"""
