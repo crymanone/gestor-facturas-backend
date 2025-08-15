@@ -2,4 +2,6 @@
 
 Backend para la aplicación de gestión de facturas.
 
-_Actualización para forzar un nuevo despliegue en Vercel._
+Actualización para forzar un nuevo despliegue en Vercel.
+
+**Segundo intento para forzar el despliegue y registrar el Cron Job.**
