@@ -1,5 +1,4 @@
-# app.py - VERSIÓN COMPLETA CON AUTENTICACIÓN FIREBASE
-
+# app.py - VERSIÓN CORREGIDA
 import os
 import json
 import io
@@ -10,7 +9,7 @@ import google.generativeai as genai
 import database as db
 import fitz
 
-# --- NUEVO: INICIALIZACIÓN DE FIREBASE ADMIN ---
+# --- INICIALIZACIÓN DE FIREBASE ADMIN ---
 import firebase_admin
 from firebase_admin import credentials, auth
 
@@ -22,7 +21,6 @@ try:
     cred_json = json.loads(firebase_sdk_json_str)
     cred = credentials.Certificate(cred_json)
     
-    # Prevenimos la reinicialización si el código se recarga (común en entornos de desarrollo)
     if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
     print("Firebase Admin SDK inicializado correctamente.")
@@ -42,7 +40,7 @@ db.init_db()
 
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-# --- NUEVO: DECORADOR DE AUTENTICACIÓN ---
+# --- DECORADOR DE AUTENTICACIÓN ---
 def check_token(f):
     @wraps(f)
     def wrap(*args,**kwargs):
@@ -53,8 +51,6 @@ def check_token(f):
         try:
             token = auth_header.split('Bearer ')[1]
             decoded_token = auth.verify_id_token(token)
-            # Guardamos el user_id en el objeto global 'g' de Flask
-            # para que esté disponible durante la vida de esta petición
             g.user_id = decoded_token['uid']
         except auth.ExpiredIdTokenError:
             return jsonify({'ok': False, 'error': 'El token ha expirado'}), 403
@@ -119,6 +115,7 @@ def upload_pdf():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
     pdf_bytes = request.data
+    # CORRECCIÓN: Pasar el user_id al crear el job
     job_id = db.create_pdf_job(pdf_bytes, g.user_id)
     if job_id:
         return jsonify({"ok": True, "job_id": job_id})
@@ -126,19 +123,21 @@ def upload_pdf():
         return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento."}), 500
 
 @app.route('/api/job_status/<job_id>', methods=['GET'])
+@check_token  # CORRECCIÓN: Añadir autenticación
 def job_status(job_id):
-    status = db.get_job_status(job_id)
+    # CORRECCIÓN: Verificar que el job pertenece al usuario
+    status = db.get_job_status(job_id, g.user_id)
     if status:
         return jsonify({"ok": True, "status": status})
     else:
-        return jsonify({"ok": False, "error": "Job ID no encontrado."}), 404
+        return jsonify({"ok": False, "error": "Job ID no encontrado o no tienes permisos."}), 404
 
 @app.route('/api/process_queue', methods=['GET'])
 def process_queue():
     auth_header = request.headers.get('Authorization')
     cron_secret = os.environ.get('CRON_SECRET')
     if not cron_secret or auth_header != f"Bearer {cron_secret}":
-        print("Acceso no autorizado a process_queue.") # Log para depuración
+        print("Acceso no autorizado a process_queue.")
         return "Unauthorized", 401
 
     job = db.get_pending_pdf_job()
@@ -147,12 +146,10 @@ def process_queue():
     
     job_id = job['id']
     pdf_bytes = job['pdf_data']
-    
-    result_json_before = job.get('result_json', {})
-    user_id_for_job = result_json_before.get('user_id') if isinstance(result_json_before, dict) else None
+    user_id_for_job = job['user_id']  # CORRECCIÓN: Obtener user_id directamente del job
 
     if not user_id_for_job:
-        db.update_job_as_failed(job['id'], "No user_id found in job metadata")
+        db.update_job_as_failed(job_id, "No user_id found in job")
         print(f"Fallo en job {job_id}: no se encontró user_id.")
         return "Fallo, job sin user_id", 500
 
@@ -182,6 +179,8 @@ def process_queue():
         db.update_job_as_failed(job_id, str(e))
         return f"Failed to process job {job_id}.", 500
 
+# ... (el resto de tus endpoints se mantienen igual) ...
+
 @app.route('/api/invoices', methods=['GET', 'POST'])
 @check_token
 def handle_invoices():
@@ -195,7 +194,7 @@ def handle_invoices():
         try:
             invoice_data = request.get_json()
             if not invoice_data or not invoice_data.get('emisor'):
-                return jsonify({"ok": False, "error": "Datos inválidos o emisor faltante"}), 400
+                return jsonify({"ok": False, 'error': "Datos inválidos o emisor faltante"}), 400
             new_id = db.add_invoice(invoice_data, "Manual", g.user_id)
             if new_id:
                 return jsonify({"ok": True, "id": new_id}), 201
@@ -282,3 +281,6 @@ def ask_assistant():
         return jsonify({"ok": True, "answer": response.text})
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
