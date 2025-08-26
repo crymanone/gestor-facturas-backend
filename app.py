@@ -1,4 +1,4 @@
-# app.py - VERSIÓN CORREGIDA
+# app.py - VERSIÓN FINAL CON LIBRERÍA PDF LIGERA
 import os
 import json
 import io
@@ -7,12 +7,11 @@ from functools import wraps
 from PIL import Image
 import google.generativeai as genai
 import database as db
-import fitz
-
-# --- INICIALIZACIÓN DE FIREBASE ADMIN ---
+from pypdf import PdfReader  # <-- CAMBIO IMPORTANTE: Usamos pypdf en lugar de fitz
 import firebase_admin
 from firebase_admin import credentials, auth
 
+# --- INICIALIZACIÓN DE FIREBASE ADMIN ---
 try:
     firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
     if not firebase_sdk_json_str:
@@ -115,7 +114,6 @@ def upload_pdf():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
     pdf_bytes = request.data
-    # CORRECCIÓN: Pasar el user_id al crear el job
     job_id = db.create_pdf_job(pdf_bytes, g.user_id)
     if job_id:
         return jsonify({"ok": True, "job_id": job_id})
@@ -123,9 +121,8 @@ def upload_pdf():
         return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento."}), 500
 
 @app.route('/api/job_status/<job_id>', methods=['GET'])
-@check_token  # CORRECCIÓN: Añadir autenticación
+@check_token
 def job_status(job_id):
-    # CORRECCIÓN: Verificar que el job pertenece al usuario
     status = db.get_job_status(job_id, g.user_id)
     if status:
         return jsonify({"ok": True, "status": status})
@@ -146,7 +143,7 @@ def process_queue():
     
     job_id = job['id']
     pdf_bytes = job['pdf_data']
-    user_id_for_job = job['user_id']  # CORRECCIÓN: Obtener user_id directamente del job
+    user_id_for_job = job['user_id']
 
     if not user_id_for_job:
         db.update_job_as_failed(job_id, "No user_id found in job")
@@ -154,16 +151,31 @@ def process_queue():
         return "Fallo, job sin user_id", 500
 
     try:
-        doc = fitz.open(stream=bytes(pdf_bytes), filetype="pdf")
-        if not len(doc): raise ValueError("El PDF en la cola está vacío.")
-        image_parts = []
-        for page in doc:
-            pix = page.get_pixmap(dpi=200)
-            img_bytes_page = pix.tobytes("jpeg")
-            img = Image.open(io.BytesIO(img_bytes_page))
-            image_parts.append(img)
+        # --- ARREGLO PARA PDFS LIGEROS ---
+        pdf_stream = io.BytesIO(bytes(pdf_bytes))
+        pdf_reader = PdfReader(pdf_stream)
         
-        response = gemini_model.generate_content([prompt_multipagina_pdf] + image_parts)
+        if not pdf_reader.pages:
+            raise ValueError("El PDF en la cola está vacío o corrupto.")
+            
+        content_parts = [prompt_multipagina_pdf]
+        
+        for page in pdf_reader.pages:
+            text = page.extract_text()
+            if text:
+                content_parts.append(text)
+            
+            for image_file_object in page.images:
+                try:
+                    img = Image.open(io.BytesIO(image_file_object.data))
+                    content_parts.append(img)
+                except Exception as img_e:
+                    print(f"No se pudo procesar una imagen del PDF en job {job_id}: {img_e}")
+
+        if len(content_parts) <= 1:
+            raise ValueError("No se pudo extraer contenido (texto o imágenes) del PDF.")
+
+        response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         final_invoice_data = json.loads(json_text)
         
@@ -178,8 +190,6 @@ def process_queue():
         print(f"Error processing job {job_id}: {e}")
         db.update_job_as_failed(job_id, str(e))
         return f"Failed to process job {job_id}.", 500
-
-# ... (el resto de tus endpoints se mantienen igual) ...
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
 @check_token

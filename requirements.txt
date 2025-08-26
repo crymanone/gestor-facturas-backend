@@ -2,5 +2,5 @@ Flask
 gunicorn
 firebase-admin
 google-generativeai
-PyMuPDF
 Pillow
+pypdf
