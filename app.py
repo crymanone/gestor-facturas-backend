@@ -1,4 +1,4 @@
-# app.py - VERSIÓN FINAL CON CORRECCIÓN DE GET_JOB_STATUS
+# app.py - VERSIÓN FINAL CON PROCESAMIENTO ASÍNCRONO PARA IMÁGENES Y PDFS
 import os
 import json
 import io
@@ -14,6 +14,7 @@ from firebase_admin import credentials, auth
 # --- INICIALIZACIÓN Y CONFIGURACIÓN ---
 app = Flask(__name__)
 try:
+    # Carga la configuración de Firebase desde variables de entorno para seguridad
     firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
     if not firebase_sdk_json_str:
         raise ValueError("La variable de entorno FIREBASE_ADMIN_SDK_JSON no está configurada.")
@@ -26,13 +27,16 @@ except Exception as e:
     print(f"ERROR CRÍTICO al inicializar Firebase: {e}")
 
 try:
+    # Carga la API Key de Google desde variables de entorno
     api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key: raise ValueError("No se encontró GOOGLE_API_KEY en las variables de entorno.")
+    if not api_key:
+        raise ValueError("No se encontró GOOGLE_API_KEY en las variables de entorno.")
     genai.configure(api_key=api_key)
     print("Google Gemini API configurada correctamente.")
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
+# Inicializa la base de datos al arrancar la app
 with app.app_context():
     db.init_db()
 
@@ -60,98 +64,120 @@ def check_token(f):
 
 # --- PROMPTS PARA LA IA ---
 prompt_plantilla_factura = """
-Actúa como un experto contable... (tu prompt)
+Actúa como un experto contable especializado en la extracción de datos de documentos.
+Analiza la siguiente imagen de una factura o ticket.
+Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON, sin texto introductorio, explicaciones o marcado de código.
+Los campos a extraer son:
+- emisor (El nombre de la empresa o persona que emite la factura)
+- cif (El identificador fiscal: CIF, NIF, VAT ID, etc.)
+- fecha (La fecha de emisión del documento en formato DD/MM/AAAA)
+- total (El importe total final pagado, como un número flotante)
+- base_imponible (El subtotal antes de impuestos, como un número flotante)
+- impuestos (Un objeto JSON con los diferentes tipos de impuesto y su valor. Ej: {"iva_21": 21.00, "otros_impuestos": 2.50})
+- conceptos (Una lista de objetos, donde cada objeto contiene 'descripcion', 'cantidad' y 'precio_unitario')
+Si un campo no se puede encontrar o no es aplicable, devuélvelo como `null`.
+Si los conceptos son difíciles de desglosar, extrae al menos una descripción general como un único concepto.
 """
+
 prompt_multipagina_pdf = """
-Actúa como un experto contable... (tu prompt)
+Actúa como un experto contable. Te proporciono una serie de textos e imágenes extraídos de las páginas de UNA ÚNICA factura en PDF.
+Analiza todo el contenido en conjunto para obtener una respuesta final y unificada.
+Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON:
+- emisor, cif, fecha, total, base_imponible, impuestos, conceptos.
+Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera aparición. Si los conceptos se reparten en varias páginas, combínalos todos en una sola lista. El 'total' y la 'base_imponible' suelen estar en la última página; prioriza esos.
+Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
 """
 
 # --- RUTAS DE LA API ---
+
 @app.route('/api/process_invoice', methods=['POST'])
 @check_token
 def process_invoice():
-    # ... (código sin cambios)
-    if not request.data: return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen"}), 400
-    try:
-        image_bytes = io.BytesIO(request.data); img = Image.open(image_bytes)
-        response = gemini_model.generate_content([prompt_plantilla_factura, img])
-        json_text = response.text.replace('```json', '').replace('```', '').strip(); extracted_data = json.loads(json_text)
-        invoice_id = db.add_invoice(extracted_data, "gemini-1.5-flash (image)", g.user_id)
-        return jsonify({"ok": True, "id": invoice_id}) if invoice_id else jsonify({"ok": False, "error": "Los datos de la imagen no se pudieron guardar."}), 500
-    except Exception as e: return jsonify({"ok": False, "error": f"Error del servidor de IA: {e}"}), 500
+    """
+    ARREGLO: Ahora es asíncrono. Acepta una imagen, crea un trabajo y devuelve un job_id.
+    """
+    if not request.data:
+        return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen"}), 400
+    job_id = db.create_image_job(request.data, g.user_id)
+    if job_id:
+        return jsonify({"ok": True, "job_id": job_id})
+    else:
+        return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento de imagen."}), 500
 
 @app.route('/api/upload_pdf', methods=['POST'])
 @check_token
 def upload_pdf():
-    if not request.data: return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
-    pdf_bytes = request.data; job_id = db.create_pdf_job(pdf_bytes, g.user_id)
-    return jsonify({"ok": True, "job_id": job_id}) if job_id else jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento."}), 500
+    if not request.data:
+        return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
+    job_id = db.create_pdf_job(request.data, g.user_id)
+    if job_id:
+        return jsonify({"ok": True, "job_id": job_id})
+    else:
+        return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento de PDF."}), 500
 
 @app.route('/api/job_status/<job_id>', methods=['GET'])
 @check_token
 def job_status(job_id):
-    # --- ARREGLO FINAL ESTÁ AQUÍ ---
-    status = db.get_job_status(job_id) # <-- SOLO PASAMOS UN ARGUMENTO
-    # --- FIN DEL ARREGLO ---
+    status = db.get_job_status(job_id, g.user_id)
     if status:
         return jsonify({"ok": True, "status": status})
     else:
-        return jsonify({"ok": False, "error": "Job ID no encontrado."}), 404
+        return jsonify({"ok": False, "error": "Job ID no encontrado o no te pertenece."}), 404
 
 @app.route('/api/process_queue', methods=['GET'])
 def process_queue():
     auth_header = request.headers.get('Authorization')
     cron_secret = os.environ.get('CRON_SECRET')
     if not cron_secret or auth_header != f"Bearer {cron_secret}":
-        print("Acceso no autorizado a process_queue."); return "Unauthorized", 401
+        print("Acceso no autorizado a process_queue.")
+        return "Unauthorized", 401
 
-    job = db.get_pending_pdf_job()
+    job = db.get_pending_job()
     if not job:
         return "No hay trabajos pendientes.", 200
     
-    job_id = job['id']; pdf_bytes = job['pdf_data']; user_id_for_job = job['user_id']
-
-    if not user_id_for_job:
-        db.update_job_as_failed(job_id, "No user_id found in job")
-        return "Fallo, job sin user_id", 500
+    job_id, job_data, user_id, job_type = job['id'], job['data'], job['user_id'], job['type']
 
     try:
-        pdf_stream = io.BytesIO(bytes(pdf_bytes))
-        pdf_reader = PdfReader(pdf_stream)
-        
-        if not pdf_reader.pages:
-            raise ValueError("El PDF en la cola está vacío o corrupto.")
-            
-        content_parts = [prompt_multipagina_pdf]
-        
-        for page in pdf_reader.pages:
-            text = page.extract_text()
-            if text:
-                content_parts.append(text)
-            for image_file_object in page.images:
-                try:
-                    img = Image.open(io.BytesIO(image_file_object.data))
-                    content_parts.append(img)
-                except Exception as img_e:
-                    print(f"No se pudo procesar una imagen del PDF en job {job_id}: {img_e}")
+        content_parts = []
+        # Procesa PDF
+        if job_type == 'pdf':
+            pdf_stream = io.BytesIO(bytes(job_data))
+            pdf_reader = PdfReader(pdf_stream)
+            if not pdf_reader.pages:
+                raise ValueError("El PDF en la cola está vacío o corrupto.")
+            content_parts.append(prompt_multipagina_pdf)
+            for page in pdf_reader.pages:
+                if text := page.extract_text():
+                    content_parts.append(text)
+                for image_obj in page.images:
+                    try:
+                        content_parts.append(Image.open(io.BytesIO(image_obj.data)))
+                    except Exception as img_e:
+                        print(f"No se pudo procesar una imagen del PDF en job {job_id}: {img_e}")
+        # Procesa Imagen
+        elif job_type == 'image':
+            image_bytes = io.BytesIO(bytes(job_data))
+            img = Image.open(image_bytes)
+            content_parts = [prompt_plantilla_factura, img]
 
         if len(content_parts) <= 1:
-            raise ValueError("No se pudo extraer contenido (texto o imágenes) del PDF.")
+            raise ValueError("No se pudo extraer contenido del fichero.")
 
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         final_invoice_data = json.loads(json_text)
         
-        invoice_id = db.add_invoice(final_invoice_data, "gemini-1.5-flash (pdf)", user_id_for_job)
+        invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
         if not invoice_id:
             raise ValueError("Falló el guardado en la tabla de facturas.")
         
-        db.update_job_as_completed(job_id, final_invoice_data)
-        print(f"Job {job_id} procesado para usuario {user_id_for_job}.")
+        db.update_job_as_completed(job_id, final_invoice_data, job_type)
+        print(f"Job {job_id} ({job_type}) procesado para usuario {user_id}.")
         return f"Job {job_id} processed successfully.", 200
     except Exception as e:
-        print(f"Error processing job {job_id}: {e}")
-        db.update_job_as_failed(job_id, str(e))
+        print(f"Error procesando job {job_id}: {e}")
+        db.update_job_as_failed(job_id, str(e), job_type)
         return f"Failed to process job {job_id}.", 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
@@ -219,4 +245,4 @@ def ask_assistant():
     return jsonify({"ok": True, "answer": response.text})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=int(os.environ.get("PORT", 5000)))
