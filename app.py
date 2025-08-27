@@ -146,7 +146,8 @@ def process_queue():
     if not job:
         return "No hay trabajos pendientes.", 200
     
-    job_id, job_data, user_id, job_type = job['id'], job['data'], job['user_id'], job['type']
+    # CORRECCIÓN: Usar 'file_data' en lugar de 'data'
+    job_id, job_data, user_id, job_type = job['id'], job['file_data'], job['user_id'], job['type']
 
     try:
         content_parts = []

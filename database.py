@@ -107,15 +107,23 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
         ))
         factura_id = cur.fetchone()[0]
         conceptos_list = invoice_data.get('conceptos', [])
+        
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
-                cur.execute(sql_concepto, (
-                    factura_id, 
-                    concepto.get('descripcion'), 
-                    to_float(concepto.get('cantidad')), 
-                    to_float(concepto.get('precio_unitario')),
-                    user_id
-                ))
+                # FILTRAR: No insertar conceptos con descripción vacía o nula
+                descripcion = concepto.get('descripcion', '').strip()
+                if descripcion:  # Solo insertar si hay descripción
+                    cur.execute(sql_concepto, (
+                        factura_id, 
+                        descripcion,
+                        to_float(concepto.get('cantidad')), 
+                        to_float(concepto.get('precio_unitario')),
+                        user_id
+                    ))
+                    print(f"💾 Concepto guardado: {descripcion}")
+                else:
+                    print(f"⚠️ Concepto omitido (descripción vacía): {concepto}")
+        
         conn.commit(); cur.close(); return factura_id
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"Error DB en add_invoice: {error}");
@@ -181,13 +189,13 @@ def get_job_status(job_id, user_id):
 def get_pending_job():
     # Obtener trabajo pendiente de ambas tablas
     sql = """
-    (SELECT id, pdf_data as data, user_id, 'pdf' as type 
+    (SELECT id, pdf_data as file_data, user_id, 'pdf' as type 
      FROM pdf_processing_queue 
      WHERE status = 'pending' 
      ORDER BY created_at 
      LIMIT 1)
     UNION ALL
-    (SELECT id, image_data as data, user_id, 'image' as type 
+    (SELECT id, image_data as file_data, user_id, 'image' as type 
      FROM image_processing_queue 
      WHERE status = 'pending' 
      ORDER BY created_at 
@@ -246,15 +254,32 @@ def get_invoice_details(invoice_id: int, user_id: str):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # Obtener factura
-        cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, user_id))
+        # Obtener factura - CORREGIR: usar user_id en ambas tablas
+        cur.execute('''
+            SELECT f.* 
+            FROM facturas f 
+            WHERE f.id = %s AND f.user_id = %s
+        ''', (invoice_id, user_id))
         invoice = cur.fetchone()
         if not invoice: 
             return None
         
-        # Obtener conceptos
-        cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (invoice_id, user_id))
-        conceptos = [dict(row) for row in cur.fetchall()]
+        # Obtener conceptos - CORREGIR: usar user_id también aquí
+        cur.execute('''
+            SELECT descripcion, cantidad, precio_unitario 
+            FROM conceptos 
+            WHERE factura_id = %s AND user_id = %s
+            AND descripcion IS NOT NULL  -- ← Filtrar conceptos nulos
+        ''', (invoice_id, user_id))
+        
+        conceptos = []
+        for row in cur.fetchall():
+            concepto = dict(row)
+            # Filtrar conceptos con descripción vacía o nula
+            if concepto.get('descripcion') and concepto['descripcion'].strip():
+                conceptos.append(concepto)
+        
+        print(f"🔍 Conceptos encontrados para factura {invoice_id}: {conceptos}")
         
         # Construir respuesta
         invoice_details = dict(invoice)
