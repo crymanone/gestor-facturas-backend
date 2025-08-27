@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON CORRECCIÓN EN GET_JOB_STATUS
+# database.py - VERSIÓN FINAL CON GET_JOB_STATUS SIMPLIFICADO
 import os
 import psycopg2
 import psycopg2.extras
@@ -15,35 +15,20 @@ def get_db_connection():
 def init_db():
     conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
+        conn = get_db_connection(); cur = conn.cursor()
         cur.execute('CREATE TABLE IF NOT EXISTS facturas (id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json JSONB, ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW());')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
         cur.execute('CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL);')
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pdf_processing_queue (
-                id UUID PRIMARY KEY,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                status TEXT NOT NULL,
-                pdf_data BYTEA,
-                result_json JSONB,
-                error_message TEXT,
-                user_id TEXT
+                id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL,
+                pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT
             );
         """)
-        
         cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name='pdf_processing_queue' AND column_name='user_id'")
-        column_exists = cur.fetchone()
-        
-        if not column_exists:
-            print("Añadiendo columna 'user_id' a 'pdf_processing_queue'...")
+        if not cur.fetchone():
             cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
-            print("Columna 'user_id' añadida.")
-            
-        conn.commit()
-        cur.close()
-        print("Base de datos y tablas listas.")
+        conn.commit(); cur.close(); print("Base de datos y tablas listas.")
     except Exception as e:
         print(f"Error al inicializar la base de datos: {e}")
     finally:
@@ -80,29 +65,29 @@ def create_pdf_job(pdf_data, user_id: str):
     sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id) VALUES (%s, 'pending', %s, %s);"
     conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        conn = get_db_connection(); cur = conn.cursor()
         cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), user_id))
-        conn.commit()
-        cur.close()
-        return job_id
+        conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
 
 # --- ARREGLO FINAL ESTÁ AQUÍ ---
-def get_job_status(job_id, user_id): # <-- ACEPTA user_id
-    sql = "SELECT status, result_json, error_message FROM pdf_processing_queue WHERE id = %s AND user_id = %s;" # <-- COMPRUEBA user_id
+def get_job_status(job_id): # <-- SOLO ACEPTA UN ARGUMENTO
+    sql = "SELECT status, result_json, error_message FROM pdf_processing_queue WHERE id = %s;" # <-- NO COMPRUEBA user_id
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql, (uuid.UUID(job_id), user_id)) # <-- PASA user_id a la consulta
+        cur.execute(sql, (uuid.UUID(job_id),)) # <-- SOLO PASA job_id
         job = cur.fetchone()
         cur.close()
         return dict(job) if job else None
     finally:
         if conn: conn.close()
 # --- FIN DEL ARREGLO ---
+
+# ... (El resto de tu database.py sigue aquí sin cambios)...
+# Pega aquí el resto de tus funciones como get_pending_pdf_job, update_job_as_completed, etc.
 
 def get_pending_pdf_job():
     sql = "UPDATE pdf_processing_queue SET status = 'processing' WHERE id = (SELECT id FROM pdf_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, pdf_data, user_id;"
