@@ -1,4 +1,4 @@
-# app.py - VERSIÓN CORREGIDA CON MANEJO DE IMÁGENES Y PDFS
+# app.py - VERSIÓN FINAL CORREGIDA
 import os
 import json
 import io
@@ -11,8 +11,8 @@ from pypdf import PdfReader
 import firebase_admin
 from firebase_admin import credentials, auth
 
-# --- INICIALIZACIÓN Y CONFIGURACIÓN ---
 app = Flask(__name__)
+
 try:
     firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
     if not firebase_sdk_json_str:
@@ -34,13 +34,11 @@ try:
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
-# Inicializa la base de datos al arrancar la app
 with app.app_context():
     db.init_db()
 
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-# --- DECORADOR DE AUTENTICACIÓN ---
 def check_token(f):
     @wraps(f)
     def wrap(*args,**kwargs):
@@ -50,7 +48,7 @@ def check_token(f):
         try:
             token = auth_header.split('Bearer ')[1]
             decoded_token = auth.verify_id_token(token)
-            g.user_id = decoded_token['uid']  # Este es el UID de Firebase (texto)
+            g.user_id = decoded_token['uid']
         except auth.ExpiredIdTokenError:
             return jsonify({'ok': False, 'error': 'El token ha expirado'}), 403
         except auth.InvalidIdTokenError as e:
@@ -60,21 +58,42 @@ def check_token(f):
         return f(*args, **kwargs)
     return wrap
 
-# --- PROMPTS PARA LA IA ---
 prompt_plantilla_factura = """
-Actúa como un experto contable especializado en la extracción de datos de documentos.
-Analiza la siguiente imagen de una factura o ticket.
-Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON, sin texto introductorio, explicaciones o marcado de código.
-Los campos a extraer son:
-- emisor (El nombre de la empresa o persona que emite la factura)
-- cif (El identificador fiscal: CIF, NIF, VAT ID, etc.)
-- fecha (La fecha de emisión del documento en formato DD/MM/AAAA)
-- total (El importe total final pagado, como un número flotante)
-- base_imponible (El subtotal antes de impuestos, como un número flotante)
-- impuestos (Un objeto JSON con los diferentes tipos de impuesto y su valor. Ej: {"iva_21": 21.00, "otros_impuestos": 2.50})
-- conceptos (Una lista de objetos, donde cada objeto contiene 'descripcion', 'cantidad' y 'precio_unitario')
-Si un campo no se puede encontrar o no es aplicable, devuélvelo como `null`.
-Si los conceptos son difíciles de desglosar, extrae al menos una descripción general como un único concepto.
+🔥🔥🔥 IMPORTANTE: EXTRACCIÓN DE CONCEPTOS OBLIGATORIA 🔥🔥🔥
+
+Eres un experto contable analizando una factura. DEBES extraer los conceptos SIEMPRE.
+
+INSTRUCCIONES ESPECÍFICAS PARA CONCEPTOS:
+1. BUSCA en la factura: tablas, listas, líneas con productos/servicios
+2. SI hay conceptos detallados: extrae CADA UNO con descripción, cantidad y precio
+3. SI NO hay conceptos detallados: crea UN concepto general con:
+   - descripcion: "Varios productos/services" + breve descripción
+   - cantidad: 1.0
+   - precio_unitario: el total de la factura
+
+FORMATO JSON OBLIGATORIO:
+{
+  "emisor": "nombre",
+  "cif": "identificador", 
+  "fecha": "DD/MM/AAAA",
+  "total": 100.0,
+  "base_imponible": 82.64,
+  "impuestos": {"iva": 21.0},
+  "conceptos": [
+    {
+      "descripcion": "Producto 1",
+      "cantidad": 2.0,
+      "precio_unitario": 25.0
+    },
+    {
+      "descripcion": "Servicio 2", 
+      "cantidad": 1.0,
+      "precio_unitario": 32.64
+    }
+  ]
+}
+
+NUNCA devuelvas un array vacío en "conceptos". SIEMPRE debe haber al menos 1 concepto.
 """
 
 prompt_multipagina_pdf = """
@@ -85,8 +104,6 @@ Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JS
 Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera aparición. Si los conceptos se reparten en varias páginas, combínalos todos en una sola lista. El 'total' y la 'base_imponible' suelen estar en la última página; prioriza esos.
 Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
 """
-
-# --- RUTAS DE LA API ---
 
 @app.route('/api/process_invoice', methods=['POST'])
 @check_token
@@ -146,7 +163,6 @@ def process_queue():
     if not job:
         return "No hay trabajos pendientes.", 200
     
-    # CORRECCIÓN: Usar 'file_data' en lugar de 'data'
     job_id, job_data, user_id, job_type = job['id'], job['file_data'], job['user_id'], job['type']
 
     try:
@@ -179,7 +195,16 @@ def process_queue():
         
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
+        
+        print("=" * 50)
+        print("🧠 RESPUESTA CRUDA DE GEMINI:")
+        print(json_text)
+        print("=" * 50)
+        
         final_invoice_data = json.loads(json_text)
+        
+        print("💾 DATOS A GUARDAR EN BD:")
+        print(json.dumps(final_invoice_data, indent=2, ensure_ascii=False))
         
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
         if not invoice_id:
@@ -189,9 +214,12 @@ def process_queue():
         return f"Job {job_id} procesado correctamente.", 200
         
     except json.JSONDecodeError as e:
+        print(f"❌ ERROR JSON: {e}")
+        print(f"📄 TEXTO QUE FALLÓ: {json_text}")
         db.update_job_as_failed(job_id, f"Error parseando JSON de Gemini: {e}", job_type)
         return f"Error en job {job_id}: Respuesta JSON inválida de Gemini", 500
     except Exception as e:
+        print(f"❌ ERROR GENERAL: {e}")
         db.update_job_as_failed(job_id, f"Error procesando documento: {str(e)}", job_type)
         return f"Error en job {job_id}: {str(e)}", 500
 

@@ -1,4 +1,4 @@
-# database.py - VERSIÓN CORREGIDA CON MANEJO DE TEXTO PARA user_id
+# database.py - VERSIÓN FINAL CORREGIDA
 import os
 import psycopg2
 import psycopg2.extras
@@ -110,9 +110,8 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
         
         if conceptos_list and isinstance(conceptos_list, list):
             for concepto in conceptos_list:
-                # FILTRAR: No insertar conceptos con descripción vacía o nula
                 descripcion = concepto.get('descripcion', '').strip()
-                if descripcion:  # Solo insertar si hay descripción
+                if descripcion:
                     cur.execute(sql_concepto, (
                         factura_id, 
                         descripcion,
@@ -120,9 +119,7 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
                         to_float(concepto.get('precio_unitario')),
                         user_id
                     ))
-                    print(f"💾 Concepto guardado: {descripcion}")
-                else:
-                    print(f"⚠️ Concepto omitido (descripción vacía): {concepto}")
+                    print(f"💾 Concepto guardado: {descripcion} para usuario {user_id}")
         
         conn.commit(); cur.close(); return factura_id
     except (Exception, psycopg2.DatabaseError) as error:
@@ -161,7 +158,6 @@ def create_image_job(image_data, user_id: str):
         if conn: conn.close()
 
 def get_job_status(job_id, user_id):
-    # Buscar en ambas tablas
     sql_pdf = "SELECT status, result_json, error_message, 'pdf' as type FROM pdf_processing_queue WHERE id = %s AND user_id = %s;"
     sql_image = "SELECT status, result_json, error_message, 'image' as type FROM image_processing_queue WHERE id = %s AND user_id = %s;"
     conn = None
@@ -169,11 +165,9 @@ def get_job_status(job_id, user_id):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # CORRECCIÓN: Usar el job_id como texto directamente
         cur.execute(sql_pdf, (job_id, user_id))
         job = cur.fetchone()
         
-        # Si no está en PDFs, buscar en imágenes
         if not job:
             cur.execute(sql_image, (job_id, user_id))
             job = cur.fetchone()
@@ -187,7 +181,6 @@ def get_job_status(job_id, user_id):
         if conn: conn.close()
         
 def get_pending_job():
-    # Obtener trabajo pendiente de ambas tablas
     sql = """
     (SELECT id, pdf_data as file_data, user_id, 'pdf' as type 
      FROM pdf_processing_queue 
@@ -215,7 +208,6 @@ def get_pending_job():
 
 def update_job_as_completed(job_id, result_json, job_type):
     table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    # CORRECCIÓN: Limpiar los datos binarios y actualizar el estado
     sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
     conn = None
     try:
@@ -227,7 +219,6 @@ def update_job_as_completed(job_id, result_json, job_type):
 
 def update_job_as_failed(job_id, error_message, job_type):
     table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    # CORRECCIÓN: Limpiar los datos binarios y actualizar el estado
     sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
     conn = None
     try:
@@ -254,38 +245,28 @@ def get_invoice_details(invoice_id: int, user_id: str):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # Obtener factura - CORREGIR: usar user_id en ambas tablas
-        cur.execute('''
-            SELECT f.* 
-            FROM facturas f 
-            WHERE f.id = %s AND f.user_id = %s
-        ''', (invoice_id, user_id))
+        cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, user_id))
         invoice = cur.fetchone()
         if not invoice: 
             return None
         
-        # Obtener conceptos - CORREGIR: usar user_id también aquí
         cur.execute('''
             SELECT descripcion, cantidad, precio_unitario 
             FROM conceptos 
             WHERE factura_id = %s AND user_id = %s
-            AND descripcion IS NOT NULL  -- ← Filtrar conceptos nulos
         ''', (invoice_id, user_id))
         
         conceptos = []
         for row in cur.fetchall():
             concepto = dict(row)
-            # Filtrar conceptos con descripción vacía o nula
             if concepto.get('descripcion') and concepto['descripcion'].strip():
                 conceptos.append(concepto)
         
         print(f"🔍 Conceptos encontrados para factura {invoice_id}: {conceptos}")
         
-        # Construir respuesta
         invoice_details = dict(invoice)
         invoice_details['conceptos'] = conceptos
         
-        # Manejar impuestos
         impuestos_json = invoice_details.get('impuestos_json')
         if impuestos_json and isinstance(impuestos_json, str):
             try:
@@ -295,7 +276,6 @@ def get_invoice_details(invoice_id: int, user_id: str):
         else:
             invoice_details['impuestos'] = impuestos_json or {}
         
-        # Limpiar campo temporal
         if 'impuestos_json' in invoice_details:
             del invoice_details['impuestos_json']
         
