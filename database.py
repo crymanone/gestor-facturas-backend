@@ -17,6 +17,7 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
         cur.execute('CREATE TABLE IF NOT EXISTS facturas (id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json JSONB, ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW());')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
         cur.execute('CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL);')
@@ -32,9 +33,9 @@ def init_db():
             );
         """)
         
-        # --- MIGRACIÓN DE LA BASE DE DATOS ---
         cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name='pdf_processing_queue' AND column_name='user_id'")
         column_exists = cur.fetchone()
+        
         if not column_exists:
             print("Añadiendo columna 'user_id' a 'pdf_processing_queue'...")
             cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
@@ -54,20 +55,13 @@ def to_float(value):
     except (ValueError, TypeError): return 0.0
 
 def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
-    sql_factura = """
-    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
-    """
+    sql_factura = "INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;"
     sql_concepto = "INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario) VALUES (%s, %s, %s, %s);"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
         impuestos_str = json.dumps(invoice_data.get('impuestos')) if isinstance(invoice_data.get('impuestos'), dict) else None
-        cur.execute(sql_factura, (
-            invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
-            to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
-            impuestos_str, ia_model, user_id
-        ))
+        cur.execute(sql_factura, (invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'), to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')), impuestos_str, ia_model, user_id))
         factura_id = cur.fetchone()[0]
         conceptos_list = invoice_data.get('conceptos', [])
         if conceptos_list and isinstance(conceptos_list, list):
