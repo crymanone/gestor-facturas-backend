@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON MIGRACIÓN DE BASE DE DATOS
+# database.py - VERSIÓN FINAL CON CORRECCIÓN EN GET_JOB_STATUS
 import os
 import psycopg2
 import psycopg2.extras
@@ -17,8 +17,6 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # --- CREACIÓN DE TABLAS (SI NO EXISTEN) ---
         cur.execute('CREATE TABLE IF NOT EXISTS facturas (id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json JSONB, ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW());')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
         cur.execute('CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL);')
@@ -29,24 +27,18 @@ def init_db():
                 status TEXT NOT NULL,
                 pdf_data BYTEA,
                 result_json JSONB,
-                error_message TEXT
+                error_message TEXT,
+                user_id TEXT
             );
         """)
         
-        # --- ARREGLO DEFINITIVO: MIGRACIÓN DE LA BASE DE DATOS ---
-        # Comprueba si la columna 'user_id' existe en la tabla de trabajos.
-        cur.execute("""
-            SELECT 1 FROM information_schema.columns 
-            WHERE table_name='pdf_processing_queue' AND column_name='user_id'
-        """)
+        # --- MIGRACIÓN DE LA BASE DE DATOS ---
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name='pdf_processing_queue' AND column_name='user_id'")
         column_exists = cur.fetchone()
-        
-        # Si la columna NO existe, la añade.
         if not column_exists:
-            print("Detectada versión antigua de la tabla 'pdf_processing_queue'. Añadiendo columna 'user_id'...")
+            print("Añadiendo columna 'user_id' a 'pdf_processing_queue'...")
             cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
-            print("Columna 'user_id' añadida correctamente.")
-        # --- FIN DEL ARREGLO ---
+            print("Columna 'user_id' añadida.")
             
         conn.commit()
         cur.close()
@@ -103,18 +95,20 @@ def create_pdf_job(pdf_data, user_id: str):
     finally:
         if conn: conn.close()
 
-def get_job_status(job_id):
-    sql = "SELECT status, result_json, error_message FROM pdf_processing_queue WHERE id = %s;"
+# --- ARREGLO FINAL ESTÁ AQUÍ ---
+def get_job_status(job_id, user_id): # <-- ACEPTA user_id
+    sql = "SELECT status, result_json, error_message FROM pdf_processing_queue WHERE id = %s AND user_id = %s;" # <-- COMPRUEBA user_id
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql, (uuid.UUID(job_id),))
+        cur.execute(sql, (uuid.UUID(job_id), user_id)) # <-- PASA user_id a la consulta
         job = cur.fetchone()
         cur.close()
         return dict(job) if job else None
     finally:
         if conn: conn.close()
+# --- FIN DEL ARREGLO ---
 
 def get_pending_pdf_job():
     sql = "UPDATE pdf_processing_queue SET status = 'processing' WHERE id = (SELECT id FROM pdf_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, pdf_data, user_id;"
