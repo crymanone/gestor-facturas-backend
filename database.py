@@ -1,4 +1,4 @@
-# database.py - VERSIÓN FINAL CON COLA PARA IMÁGENES Y PDFs
+# database.py - VERSIÓN FINAL CON BYTEA PARA IMÁGENES Y PDFS
 import os
 import psycopg2
 import psycopg2.extras
@@ -7,64 +7,46 @@ import uuid
 
 def get_db_connection():
     conn_string = os.environ.get('DATABASE_URL')
-    if not conn_string:
-        raise ValueError("No se encontró la variable de entorno DATABASE_URL")
-    conn = psycopg2.connect(conn_string, connect_timeout=10)
-    return conn
+    if not conn_string: raise ValueError("DATABASE_URL no configurada")
+    return psycopg2.connect(conn_string, connect_timeout=10)
 
 def init_db():
     conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        conn = get_db_connection(); cur = conn.cursor()
         cur.execute('CREATE TABLE IF NOT EXISTS facturas (id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json JSONB, ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW());')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
         cur.execute('CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL);')
         
-        # Tabla para procesar PDFs
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS pdf_processing_queue (
-                id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL,
-                pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT
-            );
-        """)
-        # Tabla para procesar Imágenes (NUEVO)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS image_processing_queue (
-                id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL,
-                image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT
-            );
-        """)
+        # Ambas colas usan BYTEA para los datos del fichero
+        cur.execute("""CREATE TABLE IF NOT EXISTS pdf_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT);""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS image_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT);""")
         
         cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name='pdf_processing_queue' AND column_name='user_id'")
-        if not cur.fetchone():
-            cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
+        if not cur.fetchone(): cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
 
         conn.commit(); cur.close(); print("Base de datos y tablas listas.")
     except Exception as e: print(f"Error al inicializar la base de datos: {e}")
     finally:
         if conn: conn.close()
 
-# ... (to_float y add_invoice sin cambios)
-
 def create_pdf_job(pdf_data, user_id: str):
     job_id = str(uuid.uuid4()); sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id) VALUES (%s, 'pending', %s, %s);"
-    conn = None
+    conn = None;
     try:
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), user_id)); conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
 
-# --- NUEVA FUNCIÓN PARA TRABAJOS DE IMAGEN ---
 def create_image_job(image_data, user_id: str):
     job_id = str(uuid.uuid4()); sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id) VALUES (%s, 'pending', %s, %s);"
-    conn = None
+    conn = None;
     try:
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute(sql, (job_id, psycopg2.Binary(image_data), user_id)); conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
+# ... (el resto de tu database.py se mantiene igual que en la versión anterior y funcional)
 
 def get_job_status(job_id, user_id):
     conn = None

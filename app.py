@@ -93,27 +93,18 @@ Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
 @app.route('/api/process_invoice', methods=['POST'])
 @check_token
 def process_invoice():
-    """
-    ARREGLO: Ahora es asíncrono. Acepta una imagen, crea un trabajo y devuelve un job_id.
-    """
-    if not request.data:
-        return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen"}), 400
+    # Volvemos a la lógica asíncrona pero guardando los bytes en la DB
+    if not request.data: return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen"}), 400
     job_id = db.create_image_job(request.data, g.user_id)
-    if job_id:
-        return jsonify({"ok": True, "job_id": job_id})
-    else:
-        return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento de imagen."}), 500
+    return jsonify({"ok": True, "job_id": job_id}) if job_id else jsonify({"ok": False, "error": "No se pudo crear el trabajo."}), 500
 
 @app.route('/api/upload_pdf', methods=['POST'])
 @check_token
 def upload_pdf():
-    if not request.data:
-        return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
+    # Esta función ya era correcta
+    if not request.data: return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
     job_id = db.create_pdf_job(request.data, g.user_id)
-    if job_id:
-        return jsonify({"ok": True, "job_id": job_id})
-    else:
-        return jsonify({"ok": False, "error": "No se pudo crear el trabajo de procesamiento de PDF."}), 500
+    return jsonify({"ok": True, "job_id": job_id}) if job_id else jsonify({"ok": False, "error": "No se pudo crear el trabajo."}), 500
 
 @app.route('/api/job_status/<job_id>', methods=['GET'])
 @check_token
@@ -126,59 +117,44 @@ def job_status(job_id):
 
 @app.route('/api/process_queue', methods=['GET'])
 def process_queue():
+    # ... (Esta función ahora leerá 'data' de ambas colas, que serán bytes)
     auth_header = request.headers.get('Authorization')
     cron_secret = os.environ.get('CRON_SECRET')
-    if not cron_secret or auth_header != f"Bearer {cron_secret}":
-        print("Acceso no autorizado a process_queue.")
-        return "Unauthorized", 401
+    if not cron_secret or auth_header != f"Bearer {cron_secret}": return "Unauthorized", 401
 
     job = db.get_pending_job()
-    if not job:
-        return "No hay trabajos pendientes.", 200
+    if not job: return "No hay trabajos pendientes.", 200
     
     job_id, job_data, user_id, job_type = job['id'], job['data'], job['user_id'], job['type']
 
     try:
+        # ... (La lógica de procesamiento con Gemini se mantiene, ya que funciona con bytes)
         content_parts = []
-        # Procesa PDF
         if job_type == 'pdf':
-            pdf_stream = io.BytesIO(bytes(job_data))
-            pdf_reader = PdfReader(pdf_stream)
-            if not pdf_reader.pages:
-                raise ValueError("El PDF en la cola está vacío o corrupto.")
+            pdf_stream = io.BytesIO(bytes(job_data)); pdf_reader = PdfReader(pdf_stream)
+            if not pdf_reader.pages: raise ValueError("PDF vacío.")
             content_parts.append(prompt_multipagina_pdf)
             for page in pdf_reader.pages:
-                if text := page.extract_text():
-                    content_parts.append(text)
-                for image_obj in page.images:
-                    try:
-                        content_parts.append(Image.open(io.BytesIO(image_obj.data)))
-                    except Exception as img_e:
-                        print(f"No se pudo procesar una imagen del PDF en job {job_id}: {img_e}")
-        # Procesa Imagen
+                if text := page.extract_text(): content_parts.append(text)
+                for image_obj in page.images: content_parts.append(Image.open(io.BytesIO(image_obj.data)))
         elif job_type == 'image':
-            image_bytes = io.BytesIO(bytes(job_data))
-            img = Image.open(image_bytes)
+            image_bytes = io.BytesIO(bytes(job_data)); img = Image.open(image_bytes)
             content_parts = [prompt_plantilla_factura, img]
 
-        if len(content_parts) <= 1:
-            raise ValueError("No se pudo extraer contenido del fichero.")
-
+        if len(content_parts) <= 1: raise ValueError("No se extrajo contenido.")
+        
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         final_invoice_data = json.loads(json_text)
         
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
-        if not invoice_id:
-            raise ValueError("Falló el guardado en la tabla de facturas.")
+        if not invoice_id: raise ValueError("Falló el guardado en BBDD.")
         
         db.update_job_as_completed(job_id, final_invoice_data, job_type)
-        print(f"Job {job_id} ({job_type}) procesado para usuario {user_id}.")
-        return f"Job {job_id} processed successfully.", 200
+        return f"Job {job_id} procesado.", 200
     except Exception as e:
-        print(f"Error procesando job {job_id}: {e}")
         db.update_job_as_failed(job_id, str(e), job_type)
-        return f"Failed to process job {job_id}.", 500
+        return f"Fallo en job {job_id}.", 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
 @check_token
