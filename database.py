@@ -32,8 +32,9 @@ def init_db():
             );
         """)
         cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name='pdf_processing_queue' AND column_name='user_id'")
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name='pdf_processing_queue' AND column_name='type'")
         if not cur.fetchone():
-            cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
+            cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN type TEXT DEFAULT \'pdf\';')
             
         conn.commit()
         cur.close()
@@ -161,13 +162,21 @@ def get_invoice_details(invoice_id: int, user_id: str):
         invoice_details = dict(invoice)
         invoice_details['conceptos'] = conceptos
         
-        # --- ARREGLO FINAL ESTÁ AQUÍ ---
-        # La base de datos ya devuelve un diccionario, no necesitamos json.loads
-        invoice_details['impuestos'] = invoice_details.get('impuestos_json') or {}
-        # --- FIN DEL ARREGLO ---
+        # --- CORRECCIÓN ---
+        impuestos_json = invoice_details.get('impuestos_json')
+        if impuestos_json and isinstance(impuestos_json, str):
+            try:
+                invoice_details['impuestos'] = json.loads(impuestos_json)
+            except json.JSONDecodeError:
+                invoice_details['impuestos'] = {}
+        else:
+            invoice_details['impuestos'] = impuestos_json or {}
+        # --- FIN CORRECCIÓN ---
 
-        if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
-        cur.close(); return invoice_details
+        if 'impuestos_json' in invoice_details: 
+            del invoice_details['impuestos_json']
+        cur.close()
+        return invoice_details
     finally:
         if conn: conn.close()
 
@@ -227,3 +236,54 @@ def delete_invoice(invoice_id: int, user_id: str):
         return False
     finally:
         if conn: conn.close()
+def create_image_job(image_data, user_id: str):
+    job_id = str(uuid.uuid4())
+    sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'image');"
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (job_id, psycopg2.Binary(image_data), user_id))
+        conn.commit()
+        cur.close()
+        return job_id
+    finally:
+        if conn: conn.close()
+
+def get_pending_job():
+    sql = "UPDATE pdf_processing_queue SET status = 'processing' WHERE id = (SELECT id FROM pdf_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, pdf_data as data, user_id, type;"
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(sql)
+        job = cur.fetchone()
+        conn.commit()
+        cur.close()
+        return dict(job) if job else None
+    finally:
+        if conn: conn.close()
+
+def update_job_as_completed(job_id, result_json):
+    sql = "UPDATE pdf_processing_queue SET status = 'completed', result_json = %s, pdf_data = NULL WHERE id = %s;"
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (json.dumps(result_json), job_id))
+        conn.commit()
+        cur.close()
+    finally:
+        if conn: conn.close()
+
+def update_job_as_failed(job_id, error_message):
+    sql = "UPDATE pdf_processing_queue SET status = 'failed', error_message = %s, pdf_data = NULL WHERE id = %s;"
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (error_message, job_id))
+        conn.commit()
+        cur.close()
+    finally:
+        if conn: conn.close()        

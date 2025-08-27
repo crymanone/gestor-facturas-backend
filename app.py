@@ -117,43 +117,51 @@ def job_status(job_id):
 
 @app.route('/api/process_queue', methods=['GET'])
 def process_queue():
-    # ... (Esta función ahora leerá 'data' de ambas colas, que serán bytes)
     auth_header = request.headers.get('Authorization')
     cron_secret = os.environ.get('CRON_SECRET')
-    if not cron_secret or auth_header != f"Bearer {cron_secret}": return "Unauthorized", 401
+    if not cron_secret or auth_header != f"Bearer {cron_secret}": 
+        return "Unauthorized", 401
 
+    # Obtener trabajo pendiente (tanto PDF como imagen)
     job = db.get_pending_job()
-    if not job: return "No hay trabajos pendientes.", 200
+    if not job: 
+        return "No hay trabajos pendientes.", 200
     
     job_id, job_data, user_id, job_type = job['id'], job['data'], job['user_id'], job['type']
 
     try:
-        # ... (La lógica de procesamiento con Gemini se mantiene, ya que funciona con bytes)
         content_parts = []
         if job_type == 'pdf':
-            pdf_stream = io.BytesIO(bytes(job_data)); pdf_reader = PdfReader(pdf_stream)
-            if not pdf_reader.pages: raise ValueError("PDF vacío.")
+            pdf_stream = io.BytesIO(bytes(job_data))
+            pdf_reader = PdfReader(pdf_stream)
+            if not pdf_reader.pages: 
+                raise ValueError("PDF vacío.")
             content_parts.append(prompt_multipagina_pdf)
             for page in pdf_reader.pages:
-                if text := page.extract_text(): content_parts.append(text)
-                for image_obj in page.images: content_parts.append(Image.open(io.BytesIO(image_obj.data)))
+                if text := page.extract_text(): 
+                    content_parts.append(text)
+                for image_obj in page.images:
+                    content_parts.append(Image.open(io.BytesIO(image_obj.data)))
         elif job_type == 'image':
-            image_bytes = io.BytesIO(bytes(job_data)); img = Image.open(image_bytes)
+            image_bytes = io.BytesIO(bytes(job_data))
+            img = Image.open(image_bytes)
             content_parts = [prompt_plantilla_factura, img]
 
-        if len(content_parts) <= 1: raise ValueError("No se extrajo contenido.")
+        if len(content_parts) <= 1: 
+            raise ValueError("No se extrajo contenido.")
         
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         final_invoice_data = json.loads(json_text)
         
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
-        if not invoice_id: raise ValueError("Falló el guardado en BBDD.")
+        if not invoice_id: 
+            raise ValueError("Falló el guardado en BBDD.")
         
-        db.update_job_as_completed(job_id, final_invoice_data, job_type)
+        db.update_job_as_completed(job_id, final_invoice_data)
         return f"Job {job_id} procesado.", 200
     except Exception as e:
-        db.update_job_as_failed(job_id, str(e), job_type)
+        db.update_job_as_failed(job_id, str(e))
         return f"Fallo en job {job_id}.", 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
