@@ -161,20 +161,22 @@ def get_job_status(job_id, user_id):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # Buscar en PDFs primero
-        cur.execute(sql_pdf, (uuid.UUID(job_id), user_id))
+        # CORRECCIÓN: Usar el job_id como texto, no convertirlo a UUID
+        cur.execute(sql_pdf, (job_id, user_id))  # ← Quitar uuid.UUID()
         job = cur.fetchone()
         
         # Si no está en PDFs, buscar en imágenes
         if not job:
-            cur.execute(sql_image, (uuid.UUID(job_id), user_id))
+            cur.execute(sql_image, (job_id, user_id))  # ← Quitar uuid.UUID()
             job = cur.fetchone()
         
         cur.close()
         return dict(job) if job else None
+    except Exception as e:
+        print(f"❌ ERROR en get_job_status: {e}")
+        return None
     finally:
         if conn: conn.close()
-
 def get_pending_job():
     # Obtener trabajo pendiente de ambas tablas
     sql = """

@@ -121,13 +121,18 @@ def upload_pdf():
 @app.route('/api/job_status/<job_id>', methods=['GET'])
 @check_token
 def job_status(job_id):
+    print(f"🔍 Checking job status: {job_id} for user: {g.user_id}")
+    
     try:
         status = db.get_job_status(job_id, g.user_id)
         if status:
+            print(f"✅ Job status: {status}")
             return jsonify({"ok": True, "status": status})
         else:
+            print(f"❌ Job not found or access denied")
             return jsonify({"ok": False, "error": "Job ID no encontrado o no te pertenece."}), 404
     except Exception as e:
+        print(f"💥 ERROR in job_status: {e}")
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
 @app.route('/api/process_queue', methods=['GET'])
