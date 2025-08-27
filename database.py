@@ -161,13 +161,13 @@ def get_job_status(job_id, user_id):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # CORRECCIÓN: Usar el job_id como texto, no convertirlo a UUID
-        cur.execute(sql_pdf, (job_id, user_id))  # ← Quitar uuid.UUID()
+        # CORRECCIÓN: Usar el job_id como texto directamente
+        cur.execute(sql_pdf, (job_id, user_id))
         job = cur.fetchone()
         
         # Si no está en PDFs, buscar en imágenes
         if not job:
-            cur.execute(sql_image, (job_id, user_id))  # ← Quitar uuid.UUID()
+            cur.execute(sql_image, (job_id, user_id))
             job = cur.fetchone()
         
         cur.close()
@@ -177,6 +177,7 @@ def get_job_status(job_id, user_id):
         return None
     finally:
         if conn: conn.close()
+        
 def get_pending_job():
     # Obtener trabajo pendiente de ambas tablas
     sql = """
@@ -206,7 +207,8 @@ def get_pending_job():
 
 def update_job_as_completed(job_id, result_json, job_type):
     table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, pdf_data = NULL WHERE id = %s;"
+    # CORRECCIÓN: Limpiar los datos binarios y actualizar el estado
+    sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
@@ -217,7 +219,8 @@ def update_job_as_completed(job_id, result_json, job_type):
 
 def update_job_as_failed(job_id, error_message, job_type):
     table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, pdf_data = NULL WHERE id = %s;"
+    # CORRECCIÓN: Limpiar los datos binarios y actualizar el estado
+    sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()

@@ -160,14 +160,21 @@ def process_queue():
                 if text := page.extract_text():
                     content_parts.append(text)
                 for image_obj in page.images:
-                    content_parts.append(Image.open(io.BytesIO(image_obj.data)))
+                    try:
+                        content_parts.append(Image.open(io.BytesIO(image_obj.data)))
+                    except Exception as e:
+                        print(f"⚠️ No se pudo procesar imagen en PDF: {e}")
+                        continue
         elif job_type == 'image':
-            image_bytes = io.BytesIO(bytes(job_data))
-            img = Image.open(image_bytes)
-            content_parts = [prompt_plantilla_factura, img]
+            try:
+                image_bytes = io.BytesIO(bytes(job_data))
+                img = Image.open(image_bytes)
+                content_parts = [prompt_plantilla_factura, img]
+            except Exception as e:
+                raise ValueError(f"Imagen inválida: {e}")
 
         if len(content_parts) <= 1:
-            raise ValueError("No se extrajo contenido.")
+            raise ValueError("No se extrajo contenido suficiente del documento.")
         
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
@@ -175,13 +182,17 @@ def process_queue():
         
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
         if not invoice_id:
-            raise ValueError("Falló el guardado en BBDD.")
+            raise ValueError("Falló el guardado en la base de datos.")
         
         db.update_job_as_completed(job_id, final_invoice_data, job_type)
-        return f"Job {job_id} procesado.", 200
+        return f"Job {job_id} procesado correctamente.", 200
+        
+    except json.JSONDecodeError as e:
+        db.update_job_as_failed(job_id, f"Error parseando JSON de Gemini: {e}", job_type)
+        return f"Error en job {job_id}: Respuesta JSON inválida de Gemini", 500
     except Exception as e:
-        db.update_job_as_failed(job_id, str(e), job_type)
-        return f"Fallo en job {job_id}: {str(e)}", 500
+        db.update_job_as_failed(job_id, f"Error procesando documento: {str(e)}", job_type)
+        return f"Error en job {job_id}: {str(e)}", 500
 
 @app.route('/api/invoices', methods=['GET', 'POST'])
 @check_token
