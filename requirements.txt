@@ -4,3 +4,4 @@ firebase-admin
 google-generativeai
 Pillow
 pypdf
+psycopg2-binary
