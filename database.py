@@ -1,5 +1,4 @@
-# database.py - VERSIÓN COMPLETA CON MULTI-USUARIO Y CORRECCIONES
-
+# database.py - VERSIÓN FINAL CON MIGRACIÓN DE BASE DE DATOS
 import os
 import psycopg2
 import psycopg2.extras
@@ -18,10 +17,10 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Nota: Si ya ejecutaste los ALTER TABLE, estas creaciones no harán nada si las tablas existen.
-        # Si la DB es nueva, crearán las tablas correctamente.
+        
+        # --- CREACIÓN DE TABLAS (SI NO EXISTEN) ---
         cur.execute('CREATE TABLE IF NOT EXISTS facturas (id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, total REAL, base_imponible REAL, impuestos_json JSONB, ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW());')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);') # Índice para búsquedas rápidas
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
         cur.execute('CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL);')
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pdf_processing_queue (
@@ -30,10 +29,25 @@ def init_db():
                 status TEXT NOT NULL,
                 pdf_data BYTEA,
                 result_json JSONB,
-                error_message TEXT,
-                user_id TEXT
+                error_message TEXT
             );
         """)
+        
+        # --- ARREGLO DEFINITIVO: MIGRACIÓN DE LA BASE DE DATOS ---
+        # Comprueba si la columna 'user_id' existe en la tabla de trabajos.
+        cur.execute("""
+            SELECT 1 FROM information_schema.columns 
+            WHERE table_name='pdf_processing_queue' AND column_name='user_id'
+        """)
+        column_exists = cur.fetchone()
+        
+        # Si la columna NO existe, la añade.
+        if not column_exists:
+            print("Detectada versión antigua de la tabla 'pdf_processing_queue'. Añadiendo columna 'user_id'...")
+            cur.execute('ALTER TABLE pdf_processing_queue ADD COLUMN user_id TEXT;')
+            print("Columna 'user_id' añadida correctamente.")
+        # --- FIN DEL ARREGLO ---
+            
         conn.commit()
         cur.close()
         print("Base de datos y tablas listas.")
@@ -95,7 +109,7 @@ def get_job_status(job_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql, (str(uuid.UUID(job_id)),)) # Conversión a string es clave
+        cur.execute(sql, (uuid.UUID(job_id),))
         job = cur.fetchone()
         cur.close()
         return dict(job) if job else None
@@ -158,7 +172,7 @@ def get_invoice_details(invoice_id: int, user_id: str):
         cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s', (invoice_id,))
         conceptos = [dict(row) for row in cur.fetchall()]
         invoice_details = dict(invoice)
-        invoice_details['conceptos'] = conceptos; invoice_details['impuestos'] = invoice_details.get('impuestos_json') or {}
+        invoice_details['conceptos'] = conceptos; invoice_details['impuestos'] = json.loads(invoice_details.get('impuestos_json') or '{}')
         if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
         cur.close(); return invoice_details
     finally:
@@ -169,7 +183,7 @@ def get_all_invoices_with_details(user_id: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute('SELECT * FROM facturas WHEREuser_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
+        cur.execute('SELECT * FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
         facturas = cur.fetchall()
         invoices_list = []
         for f in facturas:
