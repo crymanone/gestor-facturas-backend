@@ -1,4 +1,3 @@
-# database.py - VERSIÓN FINAL CORREGIDA
 import os
 import psycopg2
 import psycopg2.extras
@@ -119,7 +118,6 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
                         to_float(concepto.get('precio_unitario')),
                         user_id
                     ))
-                    print(f"💾 Concepto guardado: {descripcion} para usuario {user_id}")
         
         conn.commit(); cur.close(); return factura_id
     except (Exception, psycopg2.DatabaseError) as error:
@@ -206,9 +204,18 @@ def get_pending_job():
     finally:
         if conn: conn.close()
 
+# --- INICIO DE LA CORRECCIÓN ---
 def update_job_as_completed(job_id, result_json, job_type):
-    table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
+    # Determina la tabla y columna correctas según el tipo de trabajo
+    if job_type == 'pdf':
+        table_name = "pdf_processing_queue"
+        data_column_to_clear = "pdf_data"
+    else: # asume 'image'
+        table_name = "image_processing_queue"
+        data_column_to_clear = "image_data"
+
+    # La sentencia SQL ahora es dinámica para apuntar a la columna correcta
+    sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, {data_column_to_clear} = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
@@ -218,8 +225,15 @@ def update_job_as_completed(job_id, result_json, job_type):
         if conn: conn.close()
 
 def update_job_as_failed(job_id, error_message, job_type):
-    table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
+    # Misma lógica que la función anterior para el caso de fallo
+    if job_type == 'pdf':
+        table_name = "pdf_processing_queue"
+        data_column_to_clear = "pdf_data"
+    else: # asume 'image'
+        table_name = "image_processing_queue"
+        data_column_to_clear = "image_data"
+        
+    sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, {data_column_to_clear} = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
@@ -227,6 +241,7 @@ def update_job_as_failed(job_id, error_message, job_type):
         conn.commit(); cur.close()
     finally:
         if conn: conn.close()
+# --- FIN DE LA CORRECCIÓN ---
 
 def get_all_invoices(user_id: str):
     conn = None 
@@ -256,19 +271,13 @@ def get_invoice_details(invoice_id: int, user_id: str):
             WHERE factura_id = %s AND user_id = %s
         ''', (invoice_id, user_id))
         
-        conceptos = []
-        for row in cur.fetchall():
-            concepto = dict(row)
-            if concepto.get('descripcion') and concepto['descripcion'].strip():
-                conceptos.append(concepto)
-        
-        print(f"🔍 Conceptos encontrados para factura {invoice_id}: {conceptos}")
+        conceptos = [dict(row) for row in cur.fetchall() if row['descripcion'] and row['descripcion'].strip()]
         
         invoice_details = dict(invoice)
         invoice_details['conceptos'] = conceptos
         
         impuestos_json = invoice_details.get('impuestos_json')
-        if impuestos_json and isinstance(impuestos_json, str):
+        if isinstance(impuestos_json, str):
             try:
                 invoice_details['impuestos'] = json.loads(impuestos_json)
             except json.JSONDecodeError:
