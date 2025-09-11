@@ -1,4 +1,4 @@
-# database.py - VERSIÓN COMPLETA, CORREGIDA Y ROBUSTA
+# database.py - VERSIÓN COMPLETA CON LÓGICA DE MAPEADO DE USUARIO
 import os
 import psycopg2
 import psycopg2.extras
@@ -8,42 +8,20 @@ import uuid
 def get_db_connection():
     conn_string = os.environ.get('DATABASE_URL')
     if not conn_string:
-        raise ValueError("No se encontró la variable de entorno DATABASE_URL")
-    conn = psycopg2.connect(conn_string, connect_timeout=10)
-    return conn
+        raise ValueError("DATABASE_URL no encontrada.")
+    return psycopg2.connect(conn_string, connect_timeout=10)
 
-def init_db():
+def get_supabase_uid_from_firebase_uid(firebase_uid: str):
     conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS facturas (
-                id BIGSERIAL PRIMARY KEY, 
-                emisor TEXT, 
-                cif TEXT, 
-                fecha TEXT, 
-                total REAL, 
-                base_imponible REAL, 
-                impuestos_json JSONB, 
-                ia_model TEXT, 
-                user_id TEXT, 
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                estado TEXT,
-                notas TEXT
-            )
-        ''')
-        
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
-        cur.execute('''CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL, user_id TEXT)''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS pdf_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'pdf')''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS image_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'image')''')
-        
-        conn.commit()
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("SELECT supabase_uid FROM public.user_mapping WHERE firebase_uid = %s", (firebase_uid,))
+        result = cur.fetchone()
         cur.close()
-    except Exception as e:
-        print(f"Error al inicializar la base de datos: {e}")
+        return str(result[0]) if result else None
+    except (Exception, psycopg2.Error) as e:
+        print(f"Error buscando mapeo de usuario para firebase_uid {firebase_uid}: {e}")
+        return None
     finally:
         if conn: conn.close()
 
@@ -52,11 +30,11 @@ def to_float(value):
     try: return float(value)
     except (ValueError, TypeError): return 0.0
 
-def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
-    sql_factura = """
-    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id, estado, notas)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
-    """
+def add_invoice(invoice_data: dict, ia_model: str, firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return None
+    
+    sql_factura = """INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id, estado, notas) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;"""
     sql_concepto = "INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario, user_id) VALUES (%s, %s, %s, %s, %s);"
     conn = None
     try:
@@ -65,7 +43,7 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
             to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
-            impuestos_str, ia_model, user_id,
+            impuestos_str, ia_model, supabase_uid,
             invoice_data.get('estado'), invoice_data.get('notas')
         ))
         factura_id = cur.fetchone()[0]
@@ -74,7 +52,7 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
             for concepto in conceptos_list:
                 descripcion = concepto.get('descripcion', '').strip()
                 if descripcion:
-                    cur.execute(sql_concepto, (factura_id, descripcion, to_float(concepto.get('cantidad')), to_float(concepto.get('precio_unitario')), user_id))
+                    cur.execute(sql_concepto, (factura_id, descripcion, to_float(concepto.get('cantidad')), to_float(concepto.get('precio_unitario')), supabase_uid))
         conn.commit(); cur.close(); return factura_id
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"Error DB en add_invoice: {error}");
@@ -83,12 +61,15 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
     finally:
         if conn: conn.close()
 
-def update_invoice_notes(invoice_id: int, user_id: str, notes: str):
+def update_invoice_notes(invoice_id: int, firebase_uid: str, notes: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return False
+
     conn = None
     sql = "UPDATE facturas SET notas = %s WHERE id = %s AND user_id = %s RETURNING id;"
     try:
         conn = get_db_connection(); cur = conn.cursor()
-        cur.execute(sql, (notes, invoice_id, user_id))
+        cur.execute(sql, (notes, invoice_id, supabase_uid))
         was_updated = cur.fetchone() is not None
         conn.commit(); cur.close(); return was_updated
     except (Exception, psycopg2.DatabaseError) as error:
@@ -98,35 +79,32 @@ def update_invoice_notes(invoice_id: int, user_id: str, notes: str):
     finally:
         if conn: conn.close()
 
-def get_all_invoices(user_id: str):
-    conn = None 
+def get_all_invoices(firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return []
+
+    conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute('SELECT id, emisor, fecha, total, estado FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
+        cur.execute('SELECT id, emisor, fecha, total, estado FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (supabase_uid,))
         invoices = [dict(row) for row in cur.fetchall()]; cur.close(); return invoices
     finally:
         if conn: conn.close()
 
-def get_invoice_details(invoice_id: int, user_id: str):
+def get_invoice_details(invoice_id: int, firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return None
+
     conn = None
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
-        cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, user_id))
+        conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, supabase_uid))
         invoice_data = cur.fetchone()
-        
-        if not invoice_data:
-            print(f"ALERTA: No se encontró la factura {invoice_id} para el usuario {user_id}")
-            cur.close(); return None
+        if not invoice_data: return None
         
         invoice_details = dict(invoice_data)
-
-        cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (invoice_id, user_id))
-        conceptos_data = cur.fetchall()
-        
-        conceptos = [dict(row) for row in conceptos_data if row['descripcion'] and row['descripcion'].strip()]
-        invoice_details['conceptos'] = conceptos
+        cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (invoice_id, supabase_uid))
+        invoice_details['conceptos'] = [dict(row) for row in cur.fetchall()]
         
         impuestos_json = invoice_details.get('impuestos_json')
         if isinstance(impuestos_json, str):
@@ -134,57 +112,66 @@ def get_invoice_details(invoice_id: int, user_id: str):
             except json.JSONDecodeError: invoice_details['impuestos'] = {}
         else:
             invoice_details['impuestos'] = impuestos_json or {}
-        
         if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
-        
-        cur.close()
-        return invoice_details
-        
+
+        cur.close(); return invoice_details
     except (Exception, psycopg2.Error) as e:
         print(f"ERROR CRÍTICO en get_invoice_details: {e}"); return None
     finally:
         if conn: conn.close()
 
-def get_all_invoices_with_details(user_id: str):
+def get_all_invoices_with_details(firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return []
+
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute('SELECT * FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
+        cur.execute('SELECT * FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (supabase_uid,))
         facturas = cur.fetchall()
         invoices_list = []
         for f in facturas:
             details = dict(f); factura_id = details['id']
-            cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (factura_id, user_id))
+            cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (factura_id, supabase_uid))
             details['conceptos'] = [dict(row) for row in cur.fetchall()]
             invoices_list.append(details)
         cur.close(); return invoices_list
     finally:
         if conn: conn.close()
 
-def create_pdf_job(pdf_data, user_id: str):
+def create_pdf_job(pdf_data, firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return None
+    
     job_id = str(uuid.uuid4()); sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'pdf');"
     conn = None
     try:
-        conn = get_db_connection(); cur = conn.cursor(); cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), user_id)); conn.commit(); cur.close(); return job_id
+        conn = get_db_connection(); cur = conn.cursor(); cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), supabase_uid)); conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
 
-def create_image_job(image_data, user_id: str):
+def create_image_job(image_data, firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return None
+    
     job_id = str(uuid.uuid4()); sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'image');"
     conn = None
     try:
-        conn = get_db_connection(); cur = conn.cursor(); cur.execute(sql, (job_id, psycopg2.Binary(image_data), user_id)); conn.commit(); cur.close(); return job_id
+        conn = get_db_connection(); cur = conn.cursor(); cur.execute(sql, (job_id, psycopg2.Binary(image_data), supabase_uid)); conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
 
-def get_job_status(job_id, user_id):
+def get_job_status(job_id, firebase_uid):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return None
+
     sql_pdf = "SELECT status, result_json, error_message, 'pdf' as type FROM pdf_processing_queue WHERE id = %s AND user_id = %s;"
     sql_image = "SELECT status, result_json, error_message, 'image' as type FROM image_processing_queue WHERE id = %s AND user_id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql_pdf, (job_id, user_id)); job = cur.fetchone()
-        if not job: cur.execute(sql_image, (job_id, user_id)); job = cur.fetchone()
+        cur.execute(sql_pdf, (job_id, supabase_uid)); job = cur.fetchone()
+        if not job: cur.execute(sql_image, (job_id, supabase_uid)); job = cur.fetchone()
         cur.close(); return dict(job) if job else None
     except Exception as e:
         print(f"❌ ERROR en get_job_status: {e}"); return None
@@ -223,12 +210,15 @@ def update_job_as_failed(job_id, error_message, job_type):
     finally:
         if conn: conn.close()
 
-def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None):
+def search_invoices(firebase_uid: str, text_query=None, date_from=None, date_to=None):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return []
+
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         query = "SELECT DISTINCT f.id, f.emisor, f.fecha, f.total FROM facturas f LEFT JOIN conceptos c ON f.id=c.factura_id WHERE f.user_id = %s"
-        params = [user_id]
+        params = [supabase_uid]
         if text_query:
             query += " AND (LOWER(f.emisor) LIKE %s OR LOWER(c.descripcion) LIKE %s)"; params.extend([f'%{text_query.lower()}%', f'%{text_query.lower()}%'])
         if date_from:
@@ -240,11 +230,14 @@ def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None)
     finally:
         if conn: conn.close()
 
-def delete_invoice(invoice_id: int, user_id: str):
+def delete_invoice(invoice_id: int, firebase_uid: str):
+    supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
+    if not supabase_uid: return False
+
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("DELETE FROM facturas WHERE id = %s AND user_id = %s RETURNING id", (invoice_id, user_id))
+        cur.execute("DELETE FROM facturas WHERE id = %s AND user_id = %s RETURNING id", (invoice_id, supabase_uid))
         was_deleted = cur.fetchone() is not None; conn.commit(); cur.close(); return was_deleted
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"Error borrando: {error}");

@@ -1,4 +1,4 @@
-# app.py - VERSIÓN COMPLETA, CORREGIDA Y FUNCIONAL
+# app.py - VERSIÓN COMPLETA, CORREGIDA Y FUNCIONAL CON MAPEADO DE USUARIO
 import os
 import json
 import io
@@ -13,24 +13,29 @@ from firebase_admin import credentials, auth
 
 app = Flask(__name__)
 
+# --- INICIALIZACIÓN DE SERVICIOS EXTERNOS ---
 try:
     firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
-    if not firebase_sdk_json_str: raise ValueError("FIREBASE_ADMIN_SDK_JSON no configurada.")
+    if not firebase_sdk_json_str:
+        raise ValueError("La variable de entorno FIREBASE_ADMIN_SDK_JSON no está configurada.")
     cred_json = json.loads(firebase_sdk_json_str)
     cred = credentials.Certificate(cred_json)
-    if not firebase_admin._apps: firebase_admin.initialize_app(cred)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
     print("Firebase Admin SDK inicializado correctamente.")
 except Exception as e:
     print(f"ERROR CRÍTICO al inicializar Firebase: {e}")
 
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key: raise ValueError("GOOGLE_API_KEY no encontrada.")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY no encontrada.")
     genai.configure(api_key=api_key)
     print("Google Gemini API configurada correctamente.")
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
+# --- FUNCIÓN DE AUTENTICACIÓN ---
 def check_token(f):
     @wraps(f)
     def wrap(*args,**kwargs):
@@ -40,15 +45,17 @@ def check_token(f):
         try:
             token = auth_header.split('Bearer ')[1]
             decoded_token = auth.verify_id_token(token)
-            g.user_id = decoded_token['uid']
+            g.user_id = decoded_token['uid'] # g.user_id ahora es el firebase_uid
         except Exception as e:
             return jsonify({'ok': False, 'error': f'Error de autenticación: {e}'}), 403
         return f(*args, **kwargs)
     return wrap
 
+# --- INICIALIZACIÓN DE LA BASE DE DATOS ---
 with app.app_context():
     db.init_db()
 
+# --- CONFIGURACIÓN DEL MODELO DE IA Y PROMPTS ---
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
 prompt_plantilla_factura = """
@@ -57,13 +64,15 @@ Eres un experto contable analizando una factura. DEBES extraer los conceptos SIE
 INSTRUCCIONES ESPECÍFICAS PARA CONCEPTOS:
 1. BUSCA en la factura: tablas, listas, líneas con productos/servicios.
 2. SI hay conceptos detallados: extrae CADA UNO con descripción, cantidad y precio.
-3. SI NO hay conceptos detallados: crea UN concepto general.
-🔥🔥🔥 NUEVO: ANÁLISIS DE ESTADO 🔥🔥🔥
+3. SI NO hay conceptos detallados: crea UN concepto general con la descripción "Varios productos/servicios".
+🔥🔥🔥 ANÁLISIS DE ESTADO 🔥🔥🔥
 4. BUSCA EVIDENCIA VISUAL de que la factura ha sido pagada (sellos de "PAGADO", "COBRADO", firmas, etc.).
 5. Si encuentras evidencia, establece el campo "estado" a "Pagada". De lo contrario, déjalo como null.
+
 FORMATO JSON OBLIGATORIO:
 {"emisor": "nombre", "cif": "identificador", "fecha": "DD/MM/AAAA", "total": 100.0, "base_imponible": 82.64, "impuestos": {"iva": 21.0}, "estado": "Pagada", "conceptos": [{"descripcion": "Producto 1", "cantidad": 2.0, "precio_unitario": 25.0}]}
 """
+
 prompt_multipagina_pdf = """
 Actúa como un experto contable. Analiza el contenido de UNA ÚNICA factura en PDF.
 Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON:
@@ -71,6 +80,8 @@ Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JS
 Para "estado", si ves sellos de pago ('PAGADO', 'COBRADO') o firmas, pon "Pagada", si no, null.
 Combina los conceptos de todas las páginas en una sola lista. Prioriza el 'total' de la última página.
 """
+
+# --- RUTAS DE LA API ---
 
 @app.route('/api/process_invoice', methods=['POST'])
 @check_token
