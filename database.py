@@ -277,3 +277,19 @@ def delete_invoice(invoice_id: int, firebase_uid: str):
         return False
     finally:
         if conn: conn.close()
+
+def count_invoices_for_user(user_id: str):
+    conn = None
+    sql = "SELECT count(*) FROM facturas WHERE user_id = %s;"
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (user_id,))
+        count = cur.fetchone()[0]
+        cur.close()
+        return count
+    except Exception as e:
+        # Si la consulta falla, lanzamos la excepción para que el backend la capture.
+        raise e
+    finally:
+        if conn: conn.close()        

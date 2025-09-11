@@ -212,5 +212,26 @@ def ask_assistant():
         return jsonify({"ok": True, "answer": response.text})
     except Exception as e: return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
+@app.route('/api/test', methods=['GET'])
+@check_token
+def test_endpoint():
+    try:
+        # Intenta obtener el número de facturas para el usuario actual.
+        # Es una operación de solo lectura y muy simple.
+        invoices_count = db.count_invoices_for_user(g.user_id)
+        
+        # Si todo va bien, devolvemos un mensaje de éxito.
+        return jsonify({
+            "ok": True, 
+            "message": f"Endpoint de prueba exitoso. El usuario {g.user_id} tiene {invoices_count} facturas."
+        })
+    except Exception as e:
+        # Si hay CUALQUIER error, lo devolvemos para poder verlo.
+        return jsonify({
+            "ok": False,
+            "error": "El endpoint de prueba falló.",
+            "detalle_error": str(e)
+        }), 500    
+
 if __name__ == '__main__':
     app.run(debug=True, port=int(os.environ.get("PORT", 5000)))
