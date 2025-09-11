@@ -59,8 +59,14 @@ Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera apar
 @check_token
 def handle_invoices():
     if request.method == 'GET':
-        # ... (sin cambios)
+        try:
+            invoices = db.get_all_invoices(g.user_id)
+            return jsonify({"ok": True, "invoices": invoices})
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
+            
     if request.method == 'POST':
+        # >>> INICIO DE LA CORRECCIÓN DE INDENTACIÓN <<<
         try:
             invoice_data = request.get_json()
             if not invoice_data or not invoice_data.get('emisor'):
