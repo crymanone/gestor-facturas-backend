@@ -1,4 +1,4 @@
-# database.py - VERSIÓN COMPLETA CON LÓGICA DE MAPEADO DE USUARIO
+# database.py - VERSIÓN COMPLETA Y ROBUSTA CON LÓGICA DE MAPEADO DE USUARIO
 import os
 import psycopg2
 import psycopg2.extras
@@ -10,6 +10,34 @@ def get_db_connection():
     if not conn_string:
         raise ValueError("DATABASE_URL no encontrada.")
     return psycopg2.connect(conn_string, connect_timeout=10)
+
+def init_db():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS facturas (
+                id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, 
+                total REAL, base_imponible REAL, impuestos_json JSONB, 
+                ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW(),
+                estado TEXT, notas TEXT
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
+        cur.execute('''CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL, user_id TEXT)''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS pdf_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'pdf')''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS image_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'image')''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS user_mapping (firebase_uid TEXT PRIMARY KEY, supabase_uid UUID, created_at TIMESTAMPTZ DEFAULT NOW())''')
+
+        conn.commit()
+        cur.close()
+        print("Base de datos y tablas listas.")
+    except Exception as e:
+        print(f"Error al inicializar la base de datos: {e}")
+    finally:
+        if conn: conn.close()
 
 def get_supabase_uid_from_firebase_uid(firebase_uid: str):
     conn = None
@@ -123,7 +151,7 @@ def get_invoice_details(invoice_id: int, firebase_uid: str):
 def get_all_invoices_with_details(firebase_uid: str):
     supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
     if not supabase_uid: return []
-
+    
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -143,10 +171,12 @@ def create_pdf_job(pdf_data, firebase_uid: str):
     supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
     if not supabase_uid: return None
     
-    job_id = str(uuid.uuid4()); sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'pdf');"
+    job_id = str(uuid.uuid4())
+    sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'pdf');"
     conn = None
     try:
-        conn = get_db_connection(); cur = conn.cursor(); cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), supabase_uid)); conn.commit(); cur.close(); return job_id
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), supabase_uid)); conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
 
@@ -154,14 +184,16 @@ def create_image_job(image_data, firebase_uid: str):
     supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
     if not supabase_uid: return None
     
-    job_id = str(uuid.uuid4()); sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'image');"
+    job_id = str(uuid.uuid4())
+    sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'image');"
     conn = None
     try:
-        conn = get_db_connection(); cur = conn.cursor(); cur.execute(sql, (job_id, psycopg2.Binary(image_data), supabase_uid)); conn.commit(); cur.close(); return job_id
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute(sql, (job_id, psycopg2.Binary(image_data), supabase_uid)); conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
 
-def get_job_status(job_id, firebase_uid):
+def get_job_status(job_id, firebase_uid: str):
     supabase_uid = get_supabase_uid_from_firebase_uid(firebase_uid)
     if not supabase_uid: return None
 
