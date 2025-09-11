@@ -1,4 +1,4 @@
-# app.py - VERSIÓN COMPLETA, FUNCIONAL Y RESTAURADA (SIN MAPEO DE USUARIO)
+# app.py - VERSIÓN COMPLETA Y FUNCIONAL (SIN MAPEO DE USUARIO)
 import os
 import json
 import io
@@ -61,8 +61,37 @@ with app.app_context():
 
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
-prompt_plantilla_factura = """...""" # Tu prompt aquí
-prompt_multipagina_pdf = """...""" # Tu prompt aquí
+prompt_plantilla_factura = """
+🔥🔥🔥 IMPORTANTE: EXTRACCIÓN DE CONCEPTOS OBLIGATORIA 🔥🔥🔥
+Eres un experto contable analizando una factura. DEBES extraer los conceptos SIEMPRE.
+INSTRUCCIONES ESPECÍFICAS PARA CONCEPTOS:
+1. BUSCA en la factura: tablas, listas, líneas con productos/servicios.
+2. SI hay conceptos detallados: extrae CADA UNO con descripción, cantidad y precio.
+3. SI NO hay conceptos detallados: crea UN concepto general con:
+   - descripcion: "Varios productos/servicios" + breve descripción
+   - cantidad: 1.0
+   - precio_unitario: el total de la factura
+🔥🔥🔥 NUEVO: ANÁLISIS DE ESTADO 🔥🔥🔥
+4. BUSCA EVIDENCIA VISUAL de que la factura ha sido pagada. Esto incluye sellos de "PAGADO", "COBRADO", "CANCELADO", texto manuscrito que indique pago, o una firma en la zona de totales.
+5. Si encuentras dicha evidencia, establece el campo "estado" a "Pagada". De lo contrario, déjalo como null.
+
+FORMATO JSON OBLIGATORIO:
+{
+  "emisor": "nombre", "cif": "identificador", "fecha": "DD/MM/AAAA", "total": 100.0,
+  "base_imponible": 82.64, "impuestos": {"iva": 21.0}, "estado": "Pagada",
+  "conceptos": [{"descripcion": "Producto 1", "cantidad": 2.0, "precio_unitario": 25.0}]
+}
+NUNCA devuelvas un array vacío en "conceptos". SIEMPRE debe haber al menos 1 concepto.
+"""
+
+prompt_multipagina_pdf = """
+Actúa como un experto contable. Te proporciono una serie de textos e imágenes extraídos de las páginas de UNA ÚNICA factura en PDF.
+Analiza todo el contenido en conjunto para obtener una respuesta final y unificada.
+Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON:
+- emisor, cif, fecha, total, base_imponible, impuestos, conceptos, y estado.
+Para el campo "estado", busca evidencia visual de pago como sellos ('PAGADO', 'COBRADO') o firmas. Si la encuentras, pon "Pagada", si no, déjalo como null.
+Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera aparición. Si los conceptos se reparten en varias páginas, combínalos todos en una sola lista. El 'total' y la 'base_imponible' suelen estar en la última página; prioriza esos.
+"""
 
 # --- RUTAS DE LA API ---
 
