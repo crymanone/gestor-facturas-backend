@@ -1,3 +1,4 @@
+# database.py - VERSIÓN CON ESTADO Y NOTAS
 import os
 import psycopg2
 import psycopg2.extras
@@ -17,7 +18,6 @@ def init_db():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Tabla de facturas
         cur.execute('''
             CREATE TABLE IF NOT EXISTS facturas (
                 id BIGSERIAL PRIMARY KEY, 
@@ -29,56 +29,19 @@ def init_db():
                 impuestos_json JSONB, 
                 ia_model TEXT, 
                 user_id TEXT, 
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                estado TEXT,
+                notas TEXT
             )
         ''')
         
-        # Índices
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
-        
-        # Tabla de conceptos
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS conceptos (
-                id BIGSERIAL PRIMARY KEY, 
-                factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, 
-                descripcion TEXT, 
-                cantidad REAL, 
-                precio_unitario REAL,
-                user_id TEXT
-            )
-        ''')
-        
-        # Tabla de procesamiento de PDFs
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS pdf_processing_queue (
-                id UUID PRIMARY KEY,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                status TEXT NOT NULL,
-                pdf_data BYTEA,
-                result_json JSONB,
-                error_message TEXT,
-                user_id TEXT,
-                type TEXT DEFAULT 'pdf'
-            )
-        ''')
-        
-        # Tabla de procesamiento de imágenes
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS image_processing_queue (
-                id UUID PRIMARY KEY,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                status TEXT NOT NULL,
-                image_data BYTEA,
-                result_json JSONB,
-                error_message TEXT,
-                user_id TEXT,
-                type TEXT DEFAULT 'image'
-            )
-        ''')
+        cur.execute(''' CREATE TABLE IF NOT EXISTS conceptos (id BIGSERIAL PRIMARY KEY, factura_id BIGINT REFERENCES facturas(id) ON DELETE CASCADE, descripcion TEXT, cantidad REAL, precio_unitario REAL, user_id TEXT) ''')
+        cur.execute(''' CREATE TABLE IF NOT EXISTS pdf_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'pdf') ''')
+        cur.execute(''' CREATE TABLE IF NOT EXISTS image_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'image') ''')
         
         conn.commit()
         cur.close()
-        print("Base de datos y tablas listas.")
     except Exception as e:
         print(f"Error al inicializar la base de datos: {e}")
     finally:
@@ -91,8 +54,8 @@ def to_float(value):
 
 def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
     sql_factura = """
-    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id, estado, notas)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
     """
     sql_concepto = "INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario, user_id) VALUES (%s, %s, %s, %s, %s);"
     conn = None
@@ -102,7 +65,8 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
             to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
-            impuestos_str, ia_model, user_id
+            impuestos_str, ia_model, user_id,
+            invoice_data.get('estado'), invoice_data.get('notas')
         ))
         factura_id = cur.fetchone()[0]
         conceptos_list = invoice_data.get('conceptos', [])
@@ -111,13 +75,7 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
             for concepto in conceptos_list:
                 descripcion = concepto.get('descripcion', '').strip()
                 if descripcion:
-                    cur.execute(sql_concepto, (
-                        factura_id, 
-                        descripcion,
-                        to_float(concepto.get('cantidad')), 
-                        to_float(concepto.get('precio_unitario')),
-                        user_id
-                    ))
+                    cur.execute(sql_concepto, (factura_id, descripcion, to_float(concepto.get('cantidad')), to_float(concepto.get('precio_unitario')), user_id))
         
         conn.commit(); cur.close(); return factura_id
     except (Exception, psycopg2.DatabaseError) as error:
@@ -126,6 +84,60 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
         return None
     finally:
         if conn: conn.close()
+
+def update_invoice_notes(invoice_id: int, user_id: str, notes: str):
+    conn = None
+    sql = "UPDATE facturas SET notas = %s WHERE id = %s AND user_id = %s RETURNING id;"
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (notes, invoice_id, user_id))
+        was_updated = cur.fetchone() is not None
+        conn.commit()
+        cur.close()
+        return was_updated
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error actualizando notas: {error}")
+        if conn: conn.rollback()
+        return False
+    finally:
+        if conn: conn.close()
+
+def get_all_invoices(user_id: str):
+    conn = None 
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute('SELECT id, emisor, fecha, total, estado FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
+        invoices = [dict(row) for row in cur.fetchall()]
+        cur.close(); return invoices
+    finally:
+        if conn: conn.close()
+
+def get_invoice_details(invoice_id: int, user_id: str):
+    # La consulta SELECT * ya incluye las nuevas columnas, por lo que no necesita cambios.
+    # El resto de la función se mantiene igual.
+    conn = None
+    try:
+        conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, user_id))
+        invoice = cur.fetchone()
+        if not invoice: return None
+        cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (invoice_id, user_id))
+        conceptos = [dict(row) for row in cur.fetchall() if row['descripcion'] and row['descripcion'].strip()]
+        invoice_details = dict(invoice); invoice_details['conceptos'] = conceptos
+        impuestos_json = invoice_details.get('impuestos_json')
+        if isinstance(impuestos_json, str):
+            try: invoice_details['impuestos'] = json.loads(impuestos_json)
+            except json.JSONDecodeError: invoice_details['impuestos'] = {}
+        else: invoice_details['impuestos'] = impuestos_json or {}
+        if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
+        cur.close(); return invoice_details
+    except Exception as e:
+        print(f"Error en get_invoice_details: {e}"); return None
+    finally:
+        if conn: conn.close()
+
 
 def create_pdf_job(pdf_data, user_id: str):
     job_id = str(uuid.uuid4())
