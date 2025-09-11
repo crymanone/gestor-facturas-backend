@@ -1,4 +1,4 @@
-# app.py - VERSIÓN COMPLETA Y FUNCIONAL RESTAURADA
+# app.py - VERSIÓN FINAL COMPLETA, REVISADA Y FUNCIONAL
 import os
 import json
 import io
@@ -37,7 +37,7 @@ except Exception as e:
 # --- FIN: INICIALIZACIÓN ---
 
 
-# --- INICIO: FUNCIÓN DE AUTENTICACIÓN (MOVIDA A LA PARTE SUPERIOR) ---
+# --- INICIO: FUNCIÓN DE AUTENTICACIÓN ---
 def check_token(f):
     @wraps(f)
     def wrap(*args,**kwargs):
@@ -47,7 +47,7 @@ def check_token(f):
         try:
             token = auth_header.split('Bearer ')[1]
             decoded_token = auth.verify_id_token(token)
-            g.user_id = decoded_token['uid']
+            g.user_id = decoded_token['uid'] # Se usa directamente el UID de Firebase
         except auth.ExpiredIdTokenError:
             return jsonify({'ok': False, 'error': 'El token ha expirado'}), 403
         except auth.InvalidIdTokenError as e:
