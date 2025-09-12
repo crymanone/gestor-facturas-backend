@@ -1,4 +1,4 @@
-# app.py - VERSIÓN BASE FUNCIONAL RESTAURADA
+# app.py - VERSIÓN FINAL CORREGIDA
 import os
 import json
 import io
@@ -13,7 +13,6 @@ from firebase_admin import credentials, auth
 
 app = Flask(__name__)
 
-# --- INICIALIZACIÓN DE SERVICIOS ---
 try:
     firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
     if not firebase_sdk_json_str:
@@ -35,7 +34,11 @@ try:
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
-# --- FUNCIÓN DE AUTENTICACIÓN (USA FIREBASE UID DIRECTAMENTE) ---
+with app.app_context():
+    db.init_db()
+
+gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+
 def check_token(f):
     @wraps(f)
     def wrap(*args,**kwargs):
@@ -46,26 +49,28 @@ def check_token(f):
             token = auth_header.split('Bearer ')[1]
             decoded_token = auth.verify_id_token(token)
             g.user_id = decoded_token['uid']
+        except auth.ExpiredIdTokenError:
+            return jsonify({'ok': False, 'error': 'El token ha expirado'}), 403
+        except auth.InvalidIdTokenError as e:
+            return jsonify({'ok': False, 'error': f'Token inválido: {e}'}), 403
         except Exception as e:
             return jsonify({'ok': False, 'error': f'Error de autenticación: {e}'}), 403
         return f(*args, **kwargs)
     return wrap
 
-with app.app_context():
-    db.init_db()
-
-gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-
 prompt_plantilla_factura = """
 🔥🔥🔥 IMPORTANTE: EXTRACCIÓN DE CONCEPTOS OBLIGATORIA 🔥🔥🔥
+
 Eres un experto contable analizando una factura. DEBES extraer los conceptos SIEMPRE.
+
 INSTRUCCIONES ESPECÍFICAS PARA CONCEPTOS:
 1. BUSCA en la factura: tablas, listas, líneas con productos/servicios
 2. SI hay conceptos detallados: extrae CADA UNO con descripción, cantidad y precio
 3. SI NO hay conceptos detallados: crea UN concepto general con:
-   - descripcion: "Varios productos/servicios" + breve descripción
+   - descripcion: "Varios productos/services" + breve descripción
    - cantidad: 1.0
    - precio_unitario: el total de la factura
+
 FORMATO JSON OBLIGATORIO:
 {
   "emisor": "nombre",
@@ -87,27 +92,31 @@ FORMATO JSON OBLIGATORIO:
     }
   ]
 }
+
 NUNCA devuelvas un array vacío en "conceptos". SIEMPRE debe haber al menos 1 concepto.
 """
 
 prompt_multipagina_pdf = """
-Actúa como un experto contable. Te proporciono textos e imágenes de una factura en PDF.
-Analiza todo en conjunto y extrae los campos en formato JSON:
+Actúa como un experto contable. Te proporciono una serie de textos e imágenes extraídos de las páginas de UNA ÚNICA factura en PDF.
+Analiza todo el contenido en conjunto para obtener una respuesta final y unificada.
+Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON:
 - emisor, cif, fecha, total, base_imponible, impuestos, conceptos.
-Combina conceptos de varias páginas si es necesario. Prioriza el 'total' y 'base_imponible' de la última página.
-Si un campo no se encuentra, devuélvelo como `null`.
+Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera aparición. Si los conceptos se reparten en varias páginas, combínalos todos en una sola lista. El 'total' y la 'base_imponible' suelen estar en la última página; prioriza esos.
+Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
 """
-
-# --- RUTAS DE LA API ---
 
 @app.route('/api/process_invoice', methods=['POST'])
 @check_token
 def process_invoice():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ninguna imagen"}), 400
+    
     try:
         job_id = db.create_image_job(request.data, g.user_id)
-        return jsonify({"ok": True, "job_id": job_id}) if job_id else jsonify({"ok": False, "error": "No se pudo crear el trabajo."}), 500
+        if job_id:
+            return jsonify({"ok": True, "job_id": job_id})
+        else:
+            return jsonify({"ok": False, "error": "No se pudo crear el trabajo."}), 500
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
@@ -116,19 +125,31 @@ def process_invoice():
 def upload_pdf():
     if not request.data:
         return jsonify({"ok": False, "error": "No se ha enviado ningún fichero PDF"}), 400
+    
     try:
         job_id = db.create_pdf_job(request.data, g.user_id)
-        return jsonify({"ok": True, "job_id": job_id}) if job_id else jsonify({"ok": False, "error": "No se pudo crear el trabajo."}), 500
+        if job_id:
+            return jsonify({"ok": True, "job_id": job_id})
+        else:
+            return jsonify({"ok": False, "error": "No se pudo crear el trabajo."}), 500
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
 @app.route('/api/job_status/<job_id>', methods=['GET'])
 @check_token
 def job_status(job_id):
+    print(f"🔍 Checking job status: {job_id} for user: {g.user_id}")
+    
     try:
         status = db.get_job_status(job_id, g.user_id)
-        return jsonify({"ok": True, "status": status}) if status else jsonify({"ok": False, "error": "Job ID no encontrado o no te pertenece."}), 404
+        if status:
+            print(f"✅ Job status: {status}")
+            return jsonify({"ok": True, "status": status})
+        else:
+            print(f"❌ Job not found or access denied")
+            return jsonify({"ok": False, "error": "Job ID no encontrado o no te pertenece."}), 404
     except Exception as e:
+        print(f"💥 ERROR in job_status: {e}")
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
 @app.route('/api/process_queue', methods=['GET'])
@@ -143,30 +164,47 @@ def process_queue():
         return "No hay trabajos pendientes.", 200
     
     job_id, job_data, user_id, job_type = job['id'], job['file_data'], job['user_id'], job['type']
-    json_text = ""
+
     try:
         content_parts = []
         if job_type == 'pdf':
             pdf_stream = io.BytesIO(bytes(job_data))
             pdf_reader = PdfReader(pdf_stream)
-            if not pdf_reader.pages: raise ValueError("PDF vacío.")
+            if not pdf_reader.pages:
+                raise ValueError("PDF vacío.")
             content_parts.append(prompt_multipagina_pdf)
             for page in pdf_reader.pages:
-                if text := page.extract_text(): content_parts.append(text)
+                if text := page.extract_text():
+                    content_parts.append(text)
                 for image_obj in page.images:
-                    try: content_parts.append(Image.open(io.BytesIO(image_obj.data)))
-                    except Exception as e: print(f"⚠️ No se pudo procesar imagen en PDF: {e}")
+                    try:
+                        content_parts.append(Image.open(io.BytesIO(image_obj.data)))
+                    except Exception as e:
+                        print(f"⚠️ No se pudo procesar imagen en PDF: {e}")
+                        continue
         elif job_type == 'image':
-            image_bytes = io.BytesIO(bytes(job_data))
-            img = Image.open(image_bytes)
-            content_parts = [prompt_plantilla_factura, img]
-        
+            try:
+                image_bytes = io.BytesIO(bytes(job_data))
+                img = Image.open(image_bytes)
+                content_parts = [prompt_plantilla_factura, img]
+            except Exception as e:
+                raise ValueError(f"Imagen inválida: {e}")
+
         if len(content_parts) <= 1:
             raise ValueError("No se extrajo contenido suficiente del documento.")
         
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
+        
+        print("=" * 50)
+        print("🧠 RESPUESTA CRUDA DE GEMINI:")
+        print(json_text)
+        print("=" * 50)
+        
         final_invoice_data = json.loads(json_text)
+        
+        print("💾 DATOS A GUARDAR EN BD:")
+        print(json.dumps(final_invoice_data, indent=2, ensure_ascii=False))
         
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
         if not invoice_id:
@@ -176,9 +214,12 @@ def process_queue():
         return f"Job {job_id} procesado correctamente.", 200
         
     except json.JSONDecodeError as e:
-        db.update_job_as_failed(job_id, f"Error parseando JSON: {e}. Texto recibido: {json_text}", job_type)
-        return f"Error en job {job_id}: Respuesta JSON inválida", 500
+        print(f"❌ ERROR JSON: {e}")
+        print(f"📄 TEXTO QUE FALLÓ: {json_text}")
+        db.update_job_as_failed(job_id, f"Error parseando JSON de Gemini: {e}", job_type)
+        return f"Error en job {job_id}: Respuesta JSON inválida de Gemini", 500
     except Exception as e:
+        print(f"❌ ERROR GENERAL: {e}")
         db.update_job_as_failed(job_id, f"Error procesando documento: {str(e)}", job_type)
         return f"Error en job {job_id}: {str(e)}", 500
 
@@ -211,14 +252,20 @@ def handle_single_invoice(invoice_id):
     if request.method == 'GET':
         try:
             details = db.get_invoice_details(invoice_id, g.user_id)
-            return jsonify({"ok": True, "invoice": details}) if details else jsonify({"ok": False, "error": "Factura no encontrada"}), 404
+            if details:
+                return jsonify({"ok": True, "invoice": details})
+            else:
+                return jsonify({"ok": False, "error": "Factura no encontrada"}), 404
         except Exception as e:
             return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
             
     if request.method == 'DELETE':
         try:
             success = db.delete_invoice(invoice_id, g.user_id)
-            return jsonify({"ok": True, "message": "Factura borrada"}) if success else jsonify({"ok": False, "error": "No se pudo borrar"}), 404
+            if success:
+                return jsonify({"ok": True, "message": "Factura borrada"})
+            else:
+                return jsonify({"ok": False, "error": "No se pudo borrar"}), 404
         except Exception as e:
             return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 

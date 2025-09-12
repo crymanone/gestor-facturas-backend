@@ -1,4 +1,4 @@
-# database.py - VERSIÓN BASE FUNCIONAL RESTAURADA
+# database.py - VERSIÓN FINAL CORREGIDA
 import os
 import psycopg2
 import psycopg2.extras
@@ -18,6 +18,7 @@ def init_db():
         conn = get_db_connection()
         cur = conn.cursor()
         
+        # Tabla de facturas
         cur.execute('''
             CREATE TABLE IF NOT EXISTS facturas (
                 id BIGSERIAL PRIMARY KEY, 
@@ -33,8 +34,10 @@ def init_db():
             )
         ''')
         
+        # Índices
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
         
+        # Tabla de conceptos
         cur.execute('''
             CREATE TABLE IF NOT EXISTS conceptos (
                 id BIGSERIAL PRIMARY KEY, 
@@ -46,6 +49,7 @@ def init_db():
             )
         ''')
         
+        # Tabla de procesamiento de PDFs
         cur.execute('''
             CREATE TABLE IF NOT EXISTS pdf_processing_queue (
                 id UUID PRIMARY KEY,
@@ -59,6 +63,7 @@ def init_db():
             )
         ''')
         
+        # Tabla de procesamiento de imágenes
         cur.execute('''
             CREATE TABLE IF NOT EXISTS image_processing_queue (
                 id UUID PRIMARY KEY,
@@ -114,6 +119,7 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
                         to_float(concepto.get('precio_unitario')),
                         user_id
                     ))
+                    print(f"💾 Concepto guardado: {descripcion} para usuario {user_id}")
         
         conn.commit(); cur.close(); return factura_id
     except (Exception, psycopg2.DatabaseError) as error:
@@ -158,21 +164,35 @@ def get_job_status(job_id, user_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
         cur.execute(sql_pdf, (job_id, user_id))
         job = cur.fetchone()
+        
         if not job:
             cur.execute(sql_image, (job_id, user_id))
             job = cur.fetchone()
+        
         cur.close()
         return dict(job) if job else None
+    except Exception as e:
+        print(f"❌ ERROR en get_job_status: {e}")
+        return None
     finally:
         if conn: conn.close()
         
 def get_pending_job():
     sql = """
-    (SELECT id, pdf_data as file_data, user_id, 'pdf' as type FROM pdf_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1)
+    (SELECT id, pdf_data as file_data, user_id, 'pdf' as type 
+     FROM pdf_processing_queue 
+     WHERE status = 'pending' 
+     ORDER BY created_at 
+     LIMIT 1)
     UNION ALL
-    (SELECT id, image_data as file_data, user_id, 'image' as type FROM image_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1)
+    (SELECT id, image_data as file_data, user_id, 'image' as type 
+     FROM image_processing_queue 
+     WHERE status = 'pending' 
+     ORDER BY created_at 
+     LIMIT 1)
     LIMIT 1;
     """
     conn = None
@@ -188,8 +208,7 @@ def get_pending_job():
 
 def update_job_as_completed(job_id, result_json, job_type):
     table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    data_column = "pdf_data" if job_type == "pdf" else "image_data"
-    sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, {data_column} = NULL WHERE id = %s;"
+    sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
@@ -200,8 +219,7 @@ def update_job_as_completed(job_id, result_json, job_type):
 
 def update_job_as_failed(job_id, error_message, job_type):
     table_name = "pdf_processing_queue" if job_type == "pdf" else "image_processing_queue"
-    data_column = "pdf_data" if job_type == "pdf" else "image_data"
-    sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, {data_column} = NULL WHERE id = %s;"
+    sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, pdf_data = NULL, image_data = NULL WHERE id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
@@ -226,18 +244,46 @@ def get_invoice_details(invoice_id: int, user_id: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
         cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, user_id))
         invoice = cur.fetchone()
-        if not invoice: return None
-        cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (invoice_id, user_id))
-        conceptos = [dict(row) for row in cur.fetchall() if row.get('descripcion')]
+        if not invoice: 
+            return None
+        
+        cur.execute('''
+            SELECT descripcion, cantidad, precio_unitario 
+            FROM conceptos 
+            WHERE factura_id = %s AND user_id = %s
+        ''', (invoice_id, user_id))
+        
+        conceptos = []
+        for row in cur.fetchall():
+            concepto = dict(row)
+            if concepto.get('descripcion') and concepto['descripcion'].strip():
+                conceptos.append(concepto)
+        
+        print(f"🔍 Conceptos encontrados para factura {invoice_id}: {conceptos}")
+        
         invoice_details = dict(invoice)
         invoice_details['conceptos'] = conceptos
-        if invoice_details.get('impuestos_json') and isinstance(invoice_details['impuestos_json'], str):
-            try: invoice_details['impuestos'] = json.loads(invoice_details['impuestos_json'])
-            except: invoice_details['impuestos'] = {}
-        if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
-        cur.close(); return invoice_details
+        
+        impuestos_json = invoice_details.get('impuestos_json')
+        if impuestos_json and isinstance(impuestos_json, str):
+            try:
+                invoice_details['impuestos'] = json.loads(impuestos_json)
+            except json.JSONDecodeError:
+                invoice_details['impuestos'] = {}
+        else:
+            invoice_details['impuestos'] = impuestos_json or {}
+        
+        if 'impuestos_json' in invoice_details:
+            del invoice_details['impuestos_json']
+        
+        cur.close()
+        return invoice_details
+    except Exception as e:
+        print(f"Error en get_invoice_details: {e}")
+        return None
     finally:
         if conn: conn.close()
 
@@ -274,6 +320,7 @@ def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None)
         if date_to:
             query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') <= TO_DATE(%s, 'YYYY-MM-DD')"
             params.append(date_to)
+        
         query += " ORDER BY f.fecha DESC, f.id DESC"
         cur.execute(query, tuple(params))
         return [dict(row) for row in cur.fetchall()]
@@ -290,5 +337,9 @@ def delete_invoice(invoice_id: int, user_id: str):
         conn.commit()
         cur.close()
         return was_deleted
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error borrando: {error}");
+        if conn: conn.rollback()
+        return False
     finally:
         if conn: conn.close()
