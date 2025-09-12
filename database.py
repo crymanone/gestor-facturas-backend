@@ -125,25 +125,29 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
 
 def create_pdf_job(pdf_data, user_id: str):
     job_id = str(uuid.uuid4())
-    sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id) VALUES (%s, 'pending', %s, %s);"
+    sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'pdf');"
     conn = None
     try:
-        conn = get_db_connection(); cur = conn.cursor()
-        # --- CORRECCIÓN CLAVE ---
+        conn = get_db_connection()
+        cur = conn.cursor()
         cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), user_id))
-        conn.commit(); cur.close(); return job_id
+        conn.commit()
+        cur.close()
+        return job_id
     finally:
         if conn: conn.close()
 
 def create_image_job(image_data, user_id: str):
     job_id = str(uuid.uuid4())
-    sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id) VALUES (%s, 'pending', %s, %s);"
+    sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'image');"
     conn = None
     try:
-        conn = get_db_connection(); cur = conn.cursor()
-        # --- CORRECCIÓN CLAVE ---
+        conn = get_db_connection()
+        cur = conn.cursor()
         cur.execute(sql, (job_id, psycopg2.Binary(image_data), user_id))
-        conn.commit(); cur.close(); return job_id
+        conn.commit()
+        cur.close()
+        return job_id
     finally:
         if conn: conn.close()
 
