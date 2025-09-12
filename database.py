@@ -158,35 +158,21 @@ def get_job_status(job_id, user_id):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
         cur.execute(sql_pdf, (job_id, user_id))
         job = cur.fetchone()
-        
         if not job:
             cur.execute(sql_image, (job_id, user_id))
             job = cur.fetchone()
-        
         cur.close()
         return dict(job) if job else None
-    except Exception as e:
-        print(f"❌ ERROR en get_job_status: {e}")
-        return None
     finally:
         if conn: conn.close()
         
 def get_pending_job():
     sql = """
-    (SELECT id, pdf_data as file_data, user_id, 'pdf' as type 
-     FROM pdf_processing_queue 
-     WHERE status = 'pending' 
-     ORDER BY created_at 
-     LIMIT 1)
+    (SELECT id, pdf_data as file_data, user_id, 'pdf' as type FROM pdf_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1)
     UNION ALL
-    (SELECT id, image_data as file_data, user_id, 'image' as type 
-     FROM image_processing_queue 
-     WHERE status = 'pending' 
-     ORDER BY created_at 
-     LIMIT 1)
+    (SELECT id, image_data as file_data, user_id, 'image' as type FROM image_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1)
     LIMIT 1;
     """
     conn = None
@@ -240,35 +226,18 @@ def get_invoice_details(invoice_id: int, user_id: str):
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
         cur.execute('SELECT * FROM facturas WHERE id = %s AND user_id = %s', (invoice_id, user_id))
         invoice = cur.fetchone()
-        if not invoice: 
-            return None
-        
+        if not invoice: return None
         cur.execute('SELECT descripcion, cantidad, precio_unitario FROM conceptos WHERE factura_id = %s AND user_id = %s', (invoice_id, user_id))
-        conceptos = [dict(row) for row in cur.fetchall() if row['descripcion'] and row['descripcion'].strip()]
-        
+        conceptos = [dict(row) for row in cur.fetchall() if row.get('descripcion')]
         invoice_details = dict(invoice)
         invoice_details['conceptos'] = conceptos
-        
-        impuestos_json = invoice_details.get('impuestos_json')
-        if isinstance(impuestos_json, str):
-            try:
-                invoice_details['impuestos'] = json.loads(impuestos_json)
-            except json.JSONDecodeError:
-                invoice_details['impuestos'] = {}
-        else:
-            invoice_details['impuestos'] = impuestos_json or {}
-        
-        if 'impuestos_json' in invoice_details:
-            del invoice_details['impuestos_json']
-        
-        cur.close()
-        return invoice_details
-    except Exception as e:
-        print(f"Error en get_invoice_details: {e}")
-        return None
+        if invoice_details.get('impuestos_json') and isinstance(invoice_details['impuestos_json'], str):
+            try: invoice_details['impuestos'] = json.loads(invoice_details['impuestos_json'])
+            except: invoice_details['impuestos'] = {}
+        if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
+        cur.close(); return invoice_details
     finally:
         if conn: conn.close()
 
@@ -305,7 +274,6 @@ def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None)
         if date_to:
             query += " AND TO_DATE(f.fecha, 'DD/MM/YYYY') <= TO_DATE(%s, 'YYYY-MM-DD')"
             params.append(date_to)
-        
         query += " ORDER BY f.fecha DESC, f.id DESC"
         cur.execute(query, tuple(params))
         return [dict(row) for row in cur.fetchall()]
@@ -322,9 +290,5 @@ def delete_invoice(invoice_id: int, user_id: str):
         conn.commit()
         cur.close()
         return was_deleted
-    except (Exception, psycopg2.DatabaseError) as error:
-        print(f"Error borrando: {error}");
-        if conn: conn.rollback()
-        return False
     finally:
         if conn: conn.close()

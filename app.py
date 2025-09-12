@@ -91,12 +91,11 @@ NUNCA devuelvas un array vacío en "conceptos". SIEMPRE debe haber al menos 1 co
 """
 
 prompt_multipagina_pdf = """
-Actúa como un experto contable. Te proporciono una serie de textos e imágenes extraídos de las páginas de UNA ÚNICA factura en PDF.
-Analiza todo el contenido en conjunto para obtener una respuesta final y unificada.
-Extrae los siguientes campos y devuelve la respuesta estrictamente en formato JSON:
+Actúa como un experto contable. Te proporciono textos e imágenes de una factura en PDF.
+Analiza todo en conjunto y extrae los campos en formato JSON:
 - emisor, cif, fecha, total, base_imponible, impuestos, conceptos.
-Si un campo aparece en varias páginas (ej. 'emisor'), usa el de la primera aparición. Si los conceptos se reparten en varias páginas, combínalos todos en una sola lista. El 'total' y la 'base_imponible' suelen estar en la última página; prioriza esos.
-Si un campo no se puede encontrar en ninguna página, devuélvelo como `null`.
+Combina conceptos de varias páginas si es necesario. Prioriza el 'total' y 'base_imponible' de la última página.
+Si un campo no se encuentra, devuélvelo como `null`.
 """
 
 # --- RUTAS DE LA API ---
@@ -212,20 +211,14 @@ def handle_single_invoice(invoice_id):
     if request.method == 'GET':
         try:
             details = db.get_invoice_details(invoice_id, g.user_id)
-            if details:
-                return jsonify({"ok": True, "invoice": details})
-            else:
-                return jsonify({"ok": False, "error": "Factura no encontrada"}), 404
+            return jsonify({"ok": True, "invoice": details}) if details else jsonify({"ok": False, "error": "Factura no encontrada"}), 404
         except Exception as e:
             return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
             
     if request.method == 'DELETE':
         try:
             success = db.delete_invoice(invoice_id, g.user_id)
-            if success:
-                return jsonify({"ok": True, "message": "Factura borrada"})
-            else:
-                return jsonify({"ok": False, "error": "No se pudo borrar"}), 404
+            return jsonify({"ok": True, "message": "Factura borrada"}) if success else jsonify({"ok": False, "error": "No se pudo borrar"}), 404
         except Exception as e:
             return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
