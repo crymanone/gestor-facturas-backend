@@ -1,4 +1,3 @@
-# database.py - VERSIÓN CON LA CORRECCIÓN DEFINITIVA
 import os
 import psycopg2
 import psycopg2.extras
@@ -6,7 +5,6 @@ import json
 import uuid
 
 def get_db_connection():
-    # ... (código sin cambios)
     conn_string = os.environ.get('DATABASE_URL')
     if not conn_string:
         raise ValueError("No se encontró la variable de entorno DATABASE_URL")
@@ -14,16 +12,25 @@ def get_db_connection():
     return conn
 
 def init_db():
-    # ... (código sin cambios, debe incluir las tablas base sin estado/notas)
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # --- MODIFICADO: Añadidas columnas 'estado' y 'notas' a la tabla facturas ---
         cur.execute('''
             CREATE TABLE IF NOT EXISTS facturas (
-                id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, 
-                total REAL, base_imponible REAL, impuestos_json JSONB, 
-                ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+                id BIGSERIAL PRIMARY KEY,
+                emisor TEXT,
+                cif TEXT,
+                fecha TEXT,
+                total REAL,
+                base_imponible REAL,
+                impuestos_json JSONB,
+                ia_model TEXT,
+                user_id TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                estado TEXT DEFAULT 'Pendiente',
+                notas TEXT
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
@@ -47,34 +54,36 @@ def init_db():
         ''')
         conn.commit()
         cur.close()
-        print("Base de datos y tablas listas.")
+        print("Base de datos y tablas (con estado y notas) listas.")
     except Exception as e:
         print(f"Error al inicializar la base de datos: {e}")
     finally:
         if conn: conn.close()
 
-
 def to_float(value):
-    # ... (sin cambios)
     if value is None: return 0.0
     try: return float(value)
     except (ValueError, TypeError): return 0.0
 
 def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
-    # ... (código sin cambios)
+    # --- MODIFICADO: Se añade el campo 'estado' al INSERT ---
     sql_factura = """
-    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id, estado)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
     """
     sql_concepto = "INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario, user_id) VALUES (%s, %s, %s, %s, %s);"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
         impuestos_str = json.dumps(invoice_data.get('impuestos')) if isinstance(invoice_data.get('impuestos'), dict) else None
+        
+        # El estado lo determina la IA, con 'Pendiente' como valor seguro si no lo encuentra.
+        estado = invoice_data.get('estado', 'Pendiente')
+
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
             to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
-            impuestos_str, ia_model, user_id
+            impuestos_str, ia_model, user_id, estado
         ))
         factura_id = cur.fetchone()[0]
         conceptos_list = invoice_data.get('conceptos', [])
@@ -91,20 +100,18 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
     finally:
         if conn: conn.close()
 
+# (create_pdf_job y create_image_job sin cambios)
 def create_pdf_job(pdf_data, user_id: str):
-    # ... (sin cambios)
     job_id = str(uuid.uuid4())
     sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'pdf');"
-    conn = None
+    conn = None;
     try:
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute(sql, (job_id, psycopg2.Binary(pdf_data), user_id))
         conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
-
 def create_image_job(image_data, user_id: str):
-    # ... (sin cambios)
     job_id = str(uuid.uuid4())
     sql = "INSERT INTO image_processing_queue (id, status, image_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'image');"
     conn = None
@@ -115,49 +122,36 @@ def create_image_job(image_data, user_id: str):
     finally:
         if conn: conn.close()
 
+# (get_job_status y get_pending_job sin cambios)
 def get_job_status(job_id, user_id):
-    # ... (sin cambios)
     sql_pdf = "SELECT status, result_json, error_message, 'pdf' as type FROM pdf_processing_queue WHERE id = %s AND user_id = %s;"
     sql_image = "SELECT status, result_json, error_message, 'image' as type FROM image_processing_queue WHERE id = %s AND user_id = %s;"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql_pdf, (job_id, user_id))
-        job = cur.fetchone()
-        if not job:
-            cur.execute(sql_image, (job_id, user_id))
-            job = cur.fetchone()
-        cur.close()
-        return dict(job) if job else None
+        cur.execute(sql_pdf, (job_id, user_id)); job = cur.fetchone()
+        if not job: cur.execute(sql_image, (job_id, user_id)); job = cur.fetchone()
+        cur.close(); return dict(job) if job else None
     finally:
         if conn: conn.close()
-
 def get_pending_job():
-    # ... (sin cambios)
     sql = """
     (SELECT id, pdf_data as file_data, user_id, 'pdf' as type FROM pdf_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1)
     UNION ALL
     (SELECT id, image_data as file_data, user_id, 'image' as type FROM image_processing_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1)
     LIMIT 1;
     """
-    conn = None
+    conn = None;
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(sql); job = cur.fetchone(); cur.close()
-        return dict(job) if job else None
+        cur.execute(sql); job = cur.fetchone(); cur.close(); return dict(job) if job else None
     finally:
         if conn: conn.close()
 
-# --- INICIO DE LA CORRECCIÓN EN LAS FUNCIONES DE UPDATE ---
+# (update_job_as_completed y update_job_as_failed sin cambios)
 def update_job_as_completed(job_id, result_json, job_type):
-    if job_type == 'pdf':
-        table_name = "pdf_processing_queue"
-        data_column_to_clear = "pdf_data"
-    else: # asume 'image'
-        table_name = "image_processing_queue"
-        data_column_to_clear = "image_data"
-
-    # La sentencia SQL ahora es dinámica para apuntar a la tabla y columna correctas
+    table_name = "pdf_processing_queue" if job_type == 'pdf' else "image_processing_queue"
+    data_column_to_clear = "pdf_data" if job_type == 'pdf' else "image_data"
     sql = f"UPDATE {table_name} SET status = 'completed', result_json = %s, {data_column_to_clear} = NULL WHERE id = %s;"
     conn = None
     try:
@@ -166,15 +160,9 @@ def update_job_as_completed(job_id, result_json, job_type):
         conn.commit(); cur.close()
     finally:
         if conn: conn.close()
-
 def update_job_as_failed(job_id, error_message, job_type):
-    if job_type == 'pdf':
-        table_name = "pdf_processing_queue"
-        data_column_to_clear = "pdf_data"
-    else: # asume 'image'
-        table_name = "image_processing_queue"
-        data_column_to_clear = "image_data"
-        
+    table_name = "pdf_processing_queue" if job_type == 'pdf' else "image_processing_queue"
+    data_column_to_clear = "pdf_data" if job_type == 'pdf' else "image_data"
     sql = f"UPDATE {table_name} SET status = 'failed', error_message = %s, {data_column_to_clear} = NULL WHERE id = %s;"
     conn = None
     try:
@@ -183,20 +171,19 @@ def update_job_as_failed(job_id, error_message, job_type):
         conn.commit(); cur.close()
     finally:
         if conn: conn.close()
-# --- FIN DE LA CORRECCIÓN ---
 
 def get_all_invoices(user_id: str):
-    # ... (sin cambios)
-    conn = None;
+    # --- MODIFICADO: Se añade 'estado' al SELECT ---
+    conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute('SELECT id, emisor, fecha, total FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
+        cur.execute('SELECT id, emisor, fecha, total, estado FROM facturas WHERE user_id = %s ORDER BY fecha DESC, id DESC', (user_id,))
         invoices = [dict(row) for row in cur.fetchall()]; cur.close(); return invoices
     finally:
         if conn: conn.close()
 
+# (get_invoice_details y get_all_invoices_with_details usan 'SELECT *', por lo que no necesitan cambios)
 def get_invoice_details(invoice_id: int, user_id: str):
-    # ... (sin cambios)
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -213,9 +200,7 @@ def get_invoice_details(invoice_id: int, user_id: str):
         cur.close(); return invoice_details
     finally:
         if conn: conn.close()
-
 def get_all_invoices_with_details(user_id: str):
-    # ... (sin cambios)
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -230,8 +215,9 @@ def get_all_invoices_with_details(user_id: str):
     finally:
         if conn: conn.close()
 
+
+# (search_invoices y delete_invoice sin cambios)
 def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None):
-    # ... (sin cambios)
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -250,14 +236,28 @@ def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None)
         cur.execute(query, tuple(params)); return [dict(row) for row in cur.fetchall()]
     finally:
         if conn: conn.close()
-
 def delete_invoice(invoice_id: int, user_id: str):
-    # ... (sin cambios)
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
         cur.execute("DELETE FROM facturas WHERE id = %s AND user_id = %s RETURNING id", (invoice_id, user_id))
         was_deleted = cur.fetchone() is not None; conn.commit(); cur.close()
         return was_deleted
+    finally:
+        if conn: conn.close()
+
+# --- AÑADIDO: Nueva función para actualizar las notas de una factura ---
+def update_invoice_notes(invoice_id: int, user_id: str, notes: str):
+    conn = None
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("UPDATE facturas SET notas = %s WHERE id = %s AND user_id = %s RETURNING id", (notes, invoice_id, user_id))
+        was_updated = cur.fetchone() is not None
+        conn.commit(); cur.close()
+        return was_updated
+    except Exception as e:
+        print(f"Error en update_invoice_notes: {e}")
+        if conn: conn.rollback()
+        return False
     finally:
         if conn: conn.close()
