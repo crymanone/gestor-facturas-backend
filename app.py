@@ -31,7 +31,7 @@ except Exception as e:
 # (init_db y modelo Gemini sin cambios)
 with app.app_context():
     db.init_db()
-gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
 def check_token(f):
     @wraps(f)
@@ -132,7 +132,7 @@ def process_queue():
         response = gemini_model.generate_content(content_parts)
         json_text = response.text.replace('```json', '').replace('```', '').strip()
         final_invoice_data = json.loads(json_text)
-        invoice_id = db.add_invoice(final_invoice_data, f"gemini-1.5-flash ({job_type})", user_id)
+        invoice_id = db.add_invoice(final_invoice_data, f"gemini-2.0-flash ({job_type})", user_id)
         if not invoice_id: raise ValueError("Falló el guardado en la base de datos.")
         db.update_job_as_completed(job_id, final_invoice_data, job_type)
         return f"Job {job_id} procesado.", 200
