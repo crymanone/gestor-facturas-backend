@@ -3,6 +3,7 @@ import psycopg2
 import psycopg2.extras
 import json
 import uuid
+from datetime import datetime, timedelta
 
 def get_db_connection():
     conn_string = os.environ.get('DATABASE_URL')
@@ -16,21 +17,25 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # --- MODIFICADO: Añadidas columnas 'estado' y 'notas' a la tabla facturas ---
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                firebase_uid TEXT NOT NULL UNIQUE,
+                email TEXT,
+                trial_start_date TIMESTAMPTZ,
+                trial_end_date TIMESTAMPTZ,
+                subscription_status TEXT DEFAULT 'trial',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        # --- MODIFICACIÓN: Añadida columna file_info JSONB ---
         cur.execute('''
             CREATE TABLE IF NOT EXISTS facturas (
-                id BIGSERIAL PRIMARY KEY,
-                emisor TEXT,
-                cif TEXT,
-                fecha TEXT,
-                total REAL,
-                base_imponible REAL,
-                impuestos_json JSONB,
-                ia_model TEXT,
-                user_id TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                estado TEXT DEFAULT 'Pendiente',
-                notas TEXT
+                id BIGSERIAL PRIMARY KEY, emisor TEXT, cif TEXT, fecha TEXT, 
+                total REAL, base_imponible REAL, impuestos_json JSONB, 
+                ia_model TEXT, user_id TEXT, created_at TIMESTAMPTZ DEFAULT NOW(),
+                estado TEXT DEFAULT 'Pendiente', notas TEXT,
+                file_info JSONB 
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_facturas_user_id ON facturas(user_id);')
@@ -40,50 +45,85 @@ def init_db():
                 descripcion TEXT, cantidad REAL, precio_unitario REAL, user_id TEXT
             )
         ''')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS pdf_processing_queue (
-                id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL,
-                pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'pdf'
-            )
-        ''')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS image_processing_queue (
-                id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL,
-                image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT 'image'
-            )
-        ''')
+        cur.execute('CREATE TABLE IF NOT EXISTS pdf_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, pdf_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT \'pdf\')')
+        cur.execute('CREATE TABLE IF NOT EXISTS image_processing_queue (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), status TEXT NOT NULL, image_data BYTEA, result_json JSONB, error_message TEXT, user_id TEXT, type TEXT DEFAULT \'image\')')
         conn.commit()
         cur.close()
-        print("Base de datos y tablas (con estado y notas) listas.")
+        print("Base de datos y tablas listas (Cloudinary soportado).")
     except Exception as e:
         print(f"Error al inicializar la base de datos: {e}")
     finally:
         if conn: conn.close()
+
+def get_or_create_user(firebase_uid: str, email: str = None):
+    # (Sin cambios)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT * FROM users WHERE firebase_uid = %s", (firebase_uid,))
+        user = cur.fetchone()
+        if user:
+            return dict(user)
+        else:
+            start = datetime.utcnow()
+            end = start + timedelta(days=7)
+            cur.execute(
+                "INSERT INTO users (firebase_uid, email, trial_start_date, trial_end_date, subscription_status) VALUES (%s, %s, %s, %s, 'trial') RETURNING *",
+                (firebase_uid, email, start, end)
+            )
+            new_user = cur.fetchone()
+            conn.commit()
+            return dict(new_user)
+    finally:
+        if conn: conn.close()
+
+def get_user_status(firebase_uid: str):
+    # (Sin cambios)
+    user = get_or_create_user(firebase_uid)
+    if not user: return {'status': 'not_found'}
+    status = user['subscription_status']
+    is_active = False
+    if status == 'trial':
+        if datetime.utcnow().replace(tzinfo=None) < user['trial_end_date'].replace(tzinfo=None):
+            is_active = True
+            return {'status': 'trial_active', 'trial_end_date': user['trial_end_date'].isoformat(), 'is_active': is_active}
+        else:
+            conn = None
+            try:
+                conn = get_db_connection(); cur = conn.cursor()
+                cur.execute("UPDATE users SET subscription_status = 'trial_expired' WHERE firebase_uid = %s", (firebase_uid,))
+                conn.commit()
+            finally:
+                if conn: conn.close()
+            return {'status': 'trial_expired', 'is_active': False}
+    elif status in ['active', 'subscribed']:
+        return {'status': 'subscribed', 'is_active': True}
+    else: return {'status': status, 'is_active': False}
 
 def to_float(value):
     if value is None: return 0.0
     try: return float(value)
     except (ValueError, TypeError): return 0.0
 
-def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
-    # --- MODIFICADO: Se añade el campo 'estado' al INSERT ---
+# --- MODIFICADO: Acepta file_info para guardarlo en la base de datos ---
+def add_invoice(invoice_data: dict, ia_model: str, user_id: str, file_info: dict = None):
     sql_factura = """
-    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id, estado)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+    INSERT INTO facturas (emisor, cif, fecha, total, base_imponible, impuestos_json, ia_model, user_id, estado, file_info)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
     """
     sql_concepto = "INSERT INTO conceptos (factura_id, descripcion, cantidad, precio_unitario, user_id) VALUES (%s, %s, %s, %s, %s);"
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor()
         impuestos_str = json.dumps(invoice_data.get('impuestos')) if isinstance(invoice_data.get('impuestos'), dict) else None
-        
-        # El estado lo determina la IA, con 'Pendiente' como valor seguro si no lo encuentra.
         estado = invoice_data.get('estado', 'Pendiente')
+        file_info_str = json.dumps(file_info) if file_info else None
 
         cur.execute(sql_factura, (
             invoice_data.get('emisor'), invoice_data.get('cif'), invoice_data.get('fecha'),
             to_float(invoice_data.get('total')), to_float(invoice_data.get('base_imponible')),
-            impuestos_str, ia_model, user_id, estado
+            impuestos_str, ia_model, user_id, estado, file_info_str
         ))
         factura_id = cur.fetchone()[0]
         conceptos_list = invoice_data.get('conceptos', [])
@@ -100,7 +140,6 @@ def add_invoice(invoice_data: dict, ia_model: str, user_id: str):
     finally:
         if conn: conn.close()
 
-# (create_pdf_job y create_image_job sin cambios)
 def create_pdf_job(pdf_data, user_id: str):
     job_id = str(uuid.uuid4())
     sql = "INSERT INTO pdf_processing_queue (id, status, pdf_data, user_id, type) VALUES (%s, 'pending', %s, %s, 'pdf');"
@@ -121,8 +160,6 @@ def create_image_job(image_data, user_id: str):
         conn.commit(); cur.close(); return job_id
     finally:
         if conn: conn.close()
-
-# (get_job_status y get_pending_job sin cambios)
 def get_job_status(job_id, user_id):
     sql_pdf = "SELECT status, result_json, error_message, 'pdf' as type FROM pdf_processing_queue WHERE id = %s AND user_id = %s;"
     sql_image = "SELECT status, result_json, error_message, 'image' as type FROM image_processing_queue WHERE id = %s AND user_id = %s;"
@@ -147,8 +184,6 @@ def get_pending_job():
         cur.execute(sql); job = cur.fetchone(); cur.close(); return dict(job) if job else None
     finally:
         if conn: conn.close()
-
-# (update_job_as_completed y update_job_as_failed sin cambios)
 def update_job_as_completed(job_id, result_json, job_type):
     table_name = "pdf_processing_queue" if job_type == 'pdf' else "image_processing_queue"
     data_column_to_clear = "pdf_data" if job_type == 'pdf' else "image_data"
@@ -173,7 +208,6 @@ def update_job_as_failed(job_id, error_message, job_type):
         if conn: conn.close()
 
 def get_all_invoices(user_id: str):
-    # --- MODIFICADO: Se añade 'estado' al SELECT ---
     conn = None
     try:
         conn = get_db_connection(); cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -182,7 +216,6 @@ def get_all_invoices(user_id: str):
     finally:
         if conn: conn.close()
 
-# (get_invoice_details y get_all_invoices_with_details usan 'SELECT *', por lo que no necesitan cambios)
 def get_invoice_details(invoice_id: int, user_id: str):
     conn = None
     try:
@@ -197,9 +230,16 @@ def get_invoice_details(invoice_id: int, user_id: str):
             try: invoice_details['impuestos'] = json.loads(invoice_details['impuestos_json'])
             except: invoice_details['impuestos'] = {}
         if 'impuestos_json' in invoice_details: del invoice_details['impuestos_json']
+        
+        # Parseamos file_info si existe para enviarlo a la app de forma limpia
+        if invoice_details.get('file_info') and isinstance(invoice_details['file_info'], str):
+            try: invoice_details['file_info'] = json.loads(invoice_details['file_info'])
+            except: invoice_details['file_info'] = None
+
         cur.close(); return invoice_details
     finally:
         if conn: conn.close()
+
 def get_all_invoices_with_details(user_id: str):
     conn = None
     try:
@@ -215,8 +255,6 @@ def get_all_invoices_with_details(user_id: str):
     finally:
         if conn: conn.close()
 
-
-# (search_invoices y delete_invoice sin cambios)
 def search_invoices(user_id: str, text_query=None, date_from=None, date_to=None):
     conn = None
     try:
@@ -245,8 +283,6 @@ def delete_invoice(invoice_id: int, user_id: str):
         return was_deleted
     finally:
         if conn: conn.close()
-
-# --- AÑADIDO: Nueva función para actualizar las notas de una factura ---
 def update_invoice_notes(invoice_id: int, user_id: str, notes: str):
     conn = None
     try:
