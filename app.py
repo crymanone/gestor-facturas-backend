@@ -256,6 +256,7 @@ def update_notes(invoice_id):
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
+# --- MODIFICADO: IA ahora devuelve JSON estructurado con el ID de la factura ---
 @app.route('/api/ai/query', methods=['POST'])
 @check_token
 @feature_protected
@@ -266,11 +267,42 @@ def ai_query():
         user_query = query_data['query']
         all_invoices = db.get_all_invoices_with_details(g.user_id)
         if not all_invoices: return jsonify({"ok": True, "answer": "No tienes facturas registradas."})
+        
         invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False, default=str)
-        prompt_contextual = f"""Actúa como un asistente financiero experto... [TEXTO ACORTADO POR BREVEDAD, USA EL TUYO ANTERIOR]
-        DATOS: ```json\n{invoices_context}\n```\nPREGUNTA: "{user_query}" """
+        prompt_contextual = f"""Actúa como un asistente financiero experto.
+        DATOS DE FACTURAS:
+        ```json
+        {invoices_context}
+        ```
+        PREGUNTA DEL USUARIO: "{user_query}"
+        
+        INSTRUCCIONES ESTRICTAS DE RESPUESTA:
+        Debes devolver tu respuesta ÚNICAMENTE en un formato JSON válido con esta estructura:
+        {{
+          "answer": "Tu respuesta amable y conversacional aquí.",
+          "invoice_id": 123
+        }}
+        
+        Reglas:
+        1. "answer": Tu respuesta normal a la pregunta.
+        2. "invoice_id": Si el usuario pide explícitamente "ver", "mostrar", "imprimir", o "abrir" una factura concreta (por ejemplo: "muéstrame la factura de DIGI", "quiero ver el ticket de gasolina"), busca el 'id' numérico de esa factura en los DATOS y ponlo aquí. 
+        3. Si la pregunta es general (ej: "¿cuánto gasté en total?") o hay dudas sobre qué factura quiere abrir, pon "invoice_id": null. NUNCA inventes un ID.
+        """
+        
         response = gemini_model.generate_content(prompt_contextual)
-        return jsonify({"ok": True, "answer": response.text})
+        # Limpiamos posibles formatos extraños que devuelva Gemini
+        json_text = response.text.replace('```json', '').replace('```', '').strip()
+        
+        try:
+            ai_data = json.loads(json_text)
+            answer = ai_data.get("answer", "Lo siento, no pude procesar la respuesta.")
+            invoice_id = ai_data.get("invoice_id")
+        except Exception as parse_e:
+            print(f"Error parseando JSON en query: {parse_e} - Texto: {json_text}")
+            answer = json_text # Fallback por si Gemini no usa JSON
+            invoice_id = None
+            
+        return jsonify({"ok": True, "answer": answer, "invoice_id": invoice_id})
     except Exception as e: return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
 @app.route('/api/search', methods=['POST'])
