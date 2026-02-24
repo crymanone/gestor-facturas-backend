@@ -153,7 +153,7 @@ def process_queue():
         
         response = gemini_model.generate_content(content_parts)
         
-        # --- Extracción robusta de JSON ignorando texto extra ---
+        # Extracción robusta de JSON
         raw_text = response.text
         start_idx = raw_text.find('{')
         end_idx = raw_text.rfind('}')
@@ -166,28 +166,37 @@ def process_queue():
                 raise ValueError(f"El JSON extraído es inválido: {e}")
         else:
             raise ValueError("Gemini no devolvió ningún formato JSON reconocible.")
-        # ---------------------------------------------------------------
         
-        # --- Subida segura a Cloudinary (Modo Acorazado) ---
+        # --- MODIFICADO: Subida inteligente a Cloudinary diferenciando PDFs de Imágenes ---
         file_info = None
         try:
-            print("☁️ Subiendo archivo original a Cloudinary (Private)...")
+            print(f"☁️ Subiendo archivo original ({job_type}) a Cloudinary (Private)...")
             file_obj = io.BytesIO(bytes(job_data))
-            upload_result = cloudinary.uploader.upload(
-                file_obj,
-                resource_type="auto",
-                type="private", 
-                folder=f"gestor_facturas/users/{user_id}"
-            )
+            
+            upload_params = {
+                "file": file_obj,
+                "type": "private", 
+                "folder": f"gestor_facturas/users/{user_id}"
+            }
+            
+            # Si es PDF, le obligamos a que lo trate como tal
+            if job_type == 'pdf':
+                upload_params["resource_type"] = "image" # Cloudinary soporta PDF bajo la categoría 'image'
+                upload_params["format"] = "pdf"
+            else:
+                upload_params["resource_type"] = "image"
+
+            upload_result = cloudinary.uploader.upload(**upload_params)
+            
             file_info = {
                 "public_id": upload_result.get("public_id"),
                 "resource_type": upload_result.get("resource_type"),
-                "format": upload_result.get("format")
+                "format": upload_result.get("format", job_type)
             }
             print("✅ Subida a Cloudinary exitosa.")
         except Exception as e:
             print(f"❌ Error al subir a Cloudinary (se guardarán datos, pero no archivo): {e}")
-        # -----------------------------------------------------------
+        # ----------------------------------------------------------------------------------
 
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-3-flash-preview ({job_type})", user_id, file_info)
         if not invoice_id: raise ValueError("Falló el guardado en la base de datos.")
@@ -226,6 +235,7 @@ def handle_single_invoice(invoice_id):
         if success: return jsonify({"ok": True, "message": "Factura borrada"})
         else: return jsonify({"ok": False, "error": "No se pudo borrar"}), 404
 
+# --- MODIFICADO: Generación segura de URLs para PDFs ---
 @app.route('/api/invoice/<int:invoice_id>/original', methods=['GET'])
 @check_token
 @feature_protected
@@ -237,22 +247,22 @@ def get_original_document(invoice_id):
         
         f_info = details['file_info']
         
+        # Le pasamos el formato al generador para que la firma de seguridad abarque la extensión ".pdf"
         url, options = cloudinary.utils.cloudinary_url(
             f_info['public_id'],
             resource_type=f_info['resource_type'],
             type="private",
+            format=f_info.get('format'), 
             sign_url=True,
             expires_at=int(time.time()) + 900 
         )
-        
-        if f_info.get('format') == 'pdf' and not url.endswith('.pdf'):
-            url += ".pdf"
 
         return jsonify({"ok": True, "url": url})
         
     except Exception as e:
         print(f"Error generando URL de Cloudinary: {e}")
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
+# -------------------------------------------------------
 
 @app.route('/api/invoice/<int:invoice_id>/notes', methods=['PUT'])
 @check_token
