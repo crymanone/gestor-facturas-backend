@@ -1,7 +1,7 @@
 import os
 import json
 import io
-import time # Añadido
+import time
 from flask import Flask, request, jsonify, g
 from functools import wraps
 from PIL import Image
@@ -10,32 +10,32 @@ import database as db
 from pypdf import PdfReader
 import firebase_admin
 from firebase_admin import credentials, auth
-
-# --- AÑADIDO: Importar Cloudinary ---
 import cloudinary
 import cloudinary.uploader
 import cloudinary.utils
 
 app = Flask(__name__)
 
-# NOTA: Cloudinary se auto-configura si la variable CLOUDINARY_URL está presente en el entorno.
-
 try:
     firebase_sdk_json_str = os.environ.get("FIREBASE_ADMIN_SDK_JSON")
     if not firebase_sdk_json_str: raise ValueError("FIREBASE_ADMIN_SDK_JSON no configurada.")
     cred = credentials.Certificate(json.loads(firebase_sdk_json_str))
     if not firebase_admin._apps: firebase_admin.initialize_app(cred)
+    print("Firebase Admin SDK inicializado.")
 except Exception as e:
     print(f"ERROR CRÍTICO al inicializar Firebase: {e}")
+
 try:
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key: raise ValueError("No se encontró GOOGLE_API_KEY.")
     genai.configure(api_key=api_key)
+    print("Google Gemini API configurada.")
 except Exception as e:
     print(f"Error CRÍTICO al configurar Gemini: {e}")
 
 with app.app_context():
     db.init_db()
+
 gemini_model = genai.GenerativeModel('gemini-3-flash-preview')
 
 def check_token(f):
@@ -127,6 +127,7 @@ def process_queue():
     auth_header = request.headers.get('Authorization')
     cron_secret = os.environ.get('CRON_SECRET')
     if not cron_secret or auth_header != f"Bearer {cron_secret}": return "Unauthorized", 401
+    
     job = db.get_pending_job()
     if not job: return "No hay trabajos pendientes.", 200
     
@@ -135,7 +136,8 @@ def process_queue():
     try:
         content_parts = []
         if job_type == 'pdf':
-            pdf_stream = io.BytesIO(bytes(job_data)); pdf_reader = PdfReader(pdf_stream)
+            pdf_stream = io.BytesIO(bytes(job_data))
+            pdf_reader = PdfReader(pdf_stream)
             if not pdf_reader.pages: raise ValueError("PDF vacío.")
             content_parts.append(prompt_multipagina_pdf)
             for page in pdf_reader.pages:
@@ -148,33 +150,34 @@ def process_queue():
             content_parts = [prompt_plantilla_factura, img]
             
         if len(content_parts) <= 1: raise ValueError("No se extrajo contenido del documento.")
-                response = gemini_model.generate_content(content_parts)
         
-                # --- NUEVO: Extracción robusta de JSON ignorando texto extra ---
-                raw_text = response.text
-                start_idx = raw_text.find('{')
-                end_idx = raw_text.rfind('}')
+        response = gemini_model.generate_content(content_parts)
         
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    json_text = raw_text[start_idx:end_idx + 1]
-                    try:
-                        final_invoice_data = json.loads(json_text)
-                    except json.JSONDecodeError as e:
-                        raise ValueError(f"El JSON extraído es inválido: {e}")
-                else:
-                    raise ValueError("Gemini no devolvió ningún formato JSON reconocible.")
+        # --- Extracción robusta de JSON ignorando texto extra ---
+        raw_text = response.text
+        start_idx = raw_text.find('{')
+        end_idx = raw_text.rfind('}')
         
-        # --- AÑADIDO: Subida segura a Cloudinary (Modo Acorazado) ---
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_text = raw_text[start_idx:end_idx + 1]
+            try:
+                final_invoice_data = json.loads(json_text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"El JSON extraído es inválido: {e}")
+        else:
+            raise ValueError("Gemini no devolvió ningún formato JSON reconocible.")
+        # ---------------------------------------------------------------
+        
+        # --- Subida segura a Cloudinary (Modo Acorazado) ---
         file_info = None
         try:
             print("☁️ Subiendo archivo original a Cloudinary (Private)...")
             file_obj = io.BytesIO(bytes(job_data))
-            # Usamos resource_type auto para que maneje JPGs y PDFs correctamente
             upload_result = cloudinary.uploader.upload(
                 file_obj,
                 resource_type="auto",
                 type="private", 
-                folder=f"gestor_facturas/users/{user_id}" # Organización segura
+                folder=f"gestor_facturas/users/{user_id}"
             )
             file_info = {
                 "public_id": upload_result.get("public_id"),
@@ -186,7 +189,6 @@ def process_queue():
             print(f"❌ Error al subir a Cloudinary (se guardarán datos, pero no archivo): {e}")
         # -----------------------------------------------------------
 
-        # Guardamos en base de datos pasándole la info del archivo
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-3-flash-preview ({job_type})", user_id, file_info)
         if not invoice_id: raise ValueError("Falló el guardado en la base de datos.")
         
@@ -224,7 +226,6 @@ def handle_single_invoice(invoice_id):
         if success: return jsonify({"ok": True, "message": "Factura borrada"})
         else: return jsonify({"ok": False, "error": "No se pudo borrar"}), 404
 
-# --- AÑADIDO: Generador de Llaves Temporales para ver el documento ---
 @app.route('/api/invoice/<int:invoice_id>/original', methods=['GET'])
 @check_token
 @feature_protected
@@ -236,7 +237,6 @@ def get_original_document(invoice_id):
         
         f_info = details['file_info']
         
-        # Generar URL firmada que expira en 15 minutos (900 segundos)
         url, options = cloudinary.utils.cloudinary_url(
             f_info['public_id'],
             resource_type=f_info['resource_type'],
@@ -245,7 +245,6 @@ def get_original_document(invoice_id):
             expires_at=int(time.time()) + 900 
         )
         
-        # Si es PDF, Cloudinary a veces requiere la extensión para mostrarlo como documento
         if f_info.get('format') == 'pdf' and not url.endswith('.pdf'):
             url += ".pdf"
 
@@ -268,7 +267,6 @@ def update_notes(invoice_id):
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
-# --- MODIFICADO: IA ahora devuelve JSON estructurado con el ID de la factura ---
 @app.route('/api/ai/query', methods=['POST'])
 @check_token
 @feature_protected
@@ -302,16 +300,23 @@ def ai_query():
         """
         
         response = gemini_model.generate_content(prompt_contextual)
-        # Limpiamos posibles formatos extraños que devuelva Gemini
-        json_text = response.text.replace('```json', '').replace('```', '').strip()
         
-        try:
-            ai_data = json.loads(json_text)
-            answer = ai_data.get("answer", "Lo siento, no pude procesar la respuesta.")
-            invoice_id = ai_data.get("invoice_id")
-        except Exception as parse_e:
-            print(f"Error parseando JSON en query: {parse_e} - Texto: {json_text}")
-            answer = json_text # Fallback por si Gemini no usa JSON
+        raw_text = response.text
+        start_idx = raw_text.find('{')
+        end_idx = raw_text.rfind('}')
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_text = raw_text[start_idx:end_idx + 1]
+            try:
+                ai_data = json.loads(json_text)
+                answer = ai_data.get("answer", "Lo siento, no pude procesar la respuesta.")
+                invoice_id = ai_data.get("invoice_id")
+            except Exception as parse_e:
+                print(f"Error parseando JSON en query: {parse_e}")
+                answer = "Hubo un error al interpretar la respuesta de la IA."
+                invoice_id = None
+        else:
+            answer = raw_text
             invoice_id = None
             
         return jsonify({"ok": True, "answer": answer, "invoice_id": invoice_id})
@@ -320,7 +325,6 @@ def ai_query():
 @app.route('/api/search', methods=['POST'])
 @check_token
 def search():
-    # (Sin cambios)
     pass
 
 if __name__ == '__main__':
