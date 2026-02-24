@@ -148,9 +148,21 @@ def process_queue():
             content_parts = [prompt_plantilla_factura, img]
             
         if len(content_parts) <= 1: raise ValueError("No se extrajo contenido del documento.")
-        response = gemini_model.generate_content(content_parts)
-        json_text = response.text.replace('```json', '').replace('```', '').strip()
-        final_invoice_data = json.loads(json_text)
+                response = gemini_model.generate_content(content_parts)
+        
+                # --- NUEVO: Extracción robusta de JSON ignorando texto extra ---
+                raw_text = response.text
+                start_idx = raw_text.find('{')
+                end_idx = raw_text.rfind('}')
+        
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    json_text = raw_text[start_idx:end_idx + 1]
+                    try:
+                        final_invoice_data = json.loads(json_text)
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"El JSON extraído es inválido: {e}")
+                else:
+                    raise ValueError("Gemini no devolvió ningún formato JSON reconocible.")
         
         # --- AÑADIDO: Subida segura a Cloudinary (Modo Acorazado) ---
         file_info = None
