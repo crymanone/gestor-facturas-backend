@@ -71,20 +71,16 @@ def user_status():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
+# --- MODIFICADO: Prompt para IA global (Moneda dinámica) ---
 prompt_plantilla_factura = """
-Eres un experto contable con capacidades de detective. Analiza la factura y extrae los datos en formato JSON.
+Actúa como un experto contable internacional. Analiza el documento y extrae los datos en formato JSON estricto.
 INSTRUCCIONES CLAVE:
-1.  **EXTRACCIÓN DE DATOS BÁSICOS**: Extrae `emisor`, `cif`, `fecha`, `total`, `base_imponible`, y `conceptos`.
-2.  **ANÁLISIS DE ESTADO (OBLIGATORIO)**:
-    -   Examina el documento en busca de CUALQUIER evidencia de pago. Busca palabras como "PAGADO", "ABONADO", "CANCELADO", "IMPORTE PENDIENTE: 0", sellos de "RECIBIDO" o "PAGADO", o firmas que lo indiquen.
-    -   Si encuentras evidencia clara de pago, añade el campo `"estado": "Pagada"`.
-    -   Si NO encuentras evidencia clara, o ves términos como "pendiente", "vencimiento", "a pagar", añade el campo `"estado": "Pendiente"`.
-    -   Este campo es OBLIGATORIO.
-3.  **CONCEPTOS (OBLIGATORIO)**:
-    -   Extrae CADA concepto con `descripcion`, `cantidad` y `precio_unitario`.
-    -   Si no hay conceptos detallados, crea UNO general usando el `total` como `precio_unitario`. NUNCA dejes la lista de conceptos vacía.
-FORMATO JSON DE SALIDA ESTRICTO:
-{ "emisor": "Nombre", "cif": "B123", "fecha": "DD/MM/AAAA", "total": 121.00, "base_imponible": 100.00, "estado": "Pagada", "conceptos": [ {"descripcion": "Producto", "cantidad": 2.0, "precio_unitario": 50.0} ] }
+1. EXTRACCIÓN: Extrae `emisor`, `cif`, `fecha`, `total`, `base_imponible`.
+2. MONEDA (NUEVO): Identifica el símbolo de la divisa utilizada (ej: €, $, £, MXN, COP, etc.) y guárdalo en el campo `"moneda"`. Si no lo encuentras, usa "€".
+3. ESTADO (OBLIGATORIO): Examina evidencias de pago (PAGADO, PAID, PAID IN FULL, balance 0). Si está pagada, pon `"estado": "Pagada"`. Si hay dudas o está pendiente, pon `"estado": "Pendiente"`.
+4. CONCEPTOS (OBLIGATORIO): Extrae CADA concepto con `descripcion`, `cantidad` y `precio_unitario`. NUNCA dejes la lista vacía.
+FORMATO JSON ESTRICTO:
+{ "emisor": "Nombre", "cif": "B123", "fecha": "DD/MM/AAAA", "total": 121.00, "base_imponible": 100.00, "estado": "Pagada", "moneda": "$", "conceptos":[ {"descripcion": "Producto", "cantidad": 2.0, "precio_unitario": 50.0} ] }
 """
 prompt_multipagina_pdf = prompt_plantilla_factura 
 
@@ -134,7 +130,7 @@ def process_queue():
     job_id, job_data, user_id, job_type = job['id'], job['file_data'], job['user_id'], job['type']
     
     try:
-        content_parts = []
+        content_parts =[]
         if job_type == 'pdf':
             pdf_stream = io.BytesIO(bytes(job_data))
             pdf_reader = PdfReader(pdf_stream)
@@ -153,7 +149,6 @@ def process_queue():
         
         response = gemini_model.generate_content(content_parts)
         
-        # Extracción robusta de JSON
         raw_text = response.text
         start_idx = raw_text.find('{')
         end_idx = raw_text.rfind('}')
@@ -167,36 +162,24 @@ def process_queue():
         else:
             raise ValueError("Gemini no devolvió ningún formato JSON reconocible.")
         
-        # --- MODIFICADO: Subida inteligente a Cloudinary diferenciando PDFs de Imágenes ---
         file_info = None
         try:
             print(f"☁️ Subiendo archivo original ({job_type}) a Cloudinary (Private)...")
             file_obj = io.BytesIO(bytes(job_data))
-            
-            upload_params = {
-                "file": file_obj,
-                "type": "private", 
-                "folder": f"gestor_facturas/users/{user_id}"
-            }
-            
-            # Si es PDF, le obligamos a que lo trate como tal
+            upload_params = {"file": file_obj, "type": "private", "folder": f"gestor_facturas/users/{user_id}"}
             if job_type == 'pdf':
-                upload_params["resource_type"] = "image" # Cloudinary soporta PDF bajo la categoría 'image'
+                upload_params["resource_type"] = "image" 
                 upload_params["format"] = "pdf"
             else:
                 upload_params["resource_type"] = "image"
-
             upload_result = cloudinary.uploader.upload(**upload_params)
-            
             file_info = {
                 "public_id": upload_result.get("public_id"),
                 "resource_type": upload_result.get("resource_type"),
                 "format": upload_result.get("format", job_type)
             }
-            print("✅ Subida a Cloudinary exitosa.")
         except Exception as e:
             print(f"❌ Error al subir a Cloudinary (se guardarán datos, pero no archivo): {e}")
-        # ----------------------------------------------------------------------------------
 
         invoice_id = db.add_invoice(final_invoice_data, f"gemini-3-flash-preview ({job_type})", user_id, file_info)
         if not invoice_id: raise ValueError("Falló el guardado en la base de datos.")
@@ -235,7 +218,6 @@ def handle_single_invoice(invoice_id):
         if success: return jsonify({"ok": True, "message": "Factura borrada"})
         else: return jsonify({"ok": False, "error": "No se pudo borrar"}), 404
 
-# --- MODIFICADO: Generación segura de URLs para PDFs ---
 @app.route('/api/invoice/<int:invoice_id>/original', methods=['GET'])
 @check_token
 @feature_protected
@@ -247,7 +229,6 @@ def get_original_document(invoice_id):
         
         f_info = details['file_info']
         
-        # Le pasamos el formato al generador para que la firma de seguridad abarque la extensión ".pdf"
         url, options = cloudinary.utils.cloudinary_url(
             f_info['public_id'],
             resource_type=f_info['resource_type'],
@@ -256,13 +237,10 @@ def get_original_document(invoice_id):
             sign_url=True,
             expires_at=int(time.time()) + 900 
         )
-
         return jsonify({"ok": True, "url": url})
-        
     except Exception as e:
         print(f"Error generando URL de Cloudinary: {e}")
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
-# -------------------------------------------------------
 
 @app.route('/api/invoice/<int:invoice_id>/notes', methods=['PUT'])
 @check_token
@@ -289,7 +267,8 @@ def ai_query():
         if not all_invoices: return jsonify({"ok": True, "answer": "No tienes facturas registradas."})
         
         invoices_context = json.dumps(all_invoices, indent=2, ensure_ascii=False, default=str)
-        prompt_contextual = f"""Actúa como un asistente financiero experto.
+        # --- MODIFICADO: Instrucción para Multi-idioma ---
+        prompt_contextual = f"""Actúa como un asistente financiero experto y servicial.
         DATOS DE FACTURAS:
         ```json
         {invoices_context}
@@ -297,16 +276,13 @@ def ai_query():
         PREGUNTA DEL USUARIO: "{user_query}"
         
         INSTRUCCIONES ESTRICTAS DE RESPUESTA:
-        Debes devolver tu respuesta ÚNICAMENTE en un formato JSON válido con esta estructura:
+        1. IMPORTANTE IDIOMA: Responde EXACTAMENTE en el mismo idioma en el que está escrita la PREGUNTA DEL USUARIO (ej. si pregunta en inglés, responde en inglés).
+        2. Debes devolver tu respuesta ÚNICAMENTE en formato JSON válido:
         {{
           "answer": "Tu respuesta amable y conversacional aquí.",
           "invoice_id": 123
         }}
-        
-        Reglas:
-        1. "answer": Tu respuesta normal a la pregunta.
-        2. "invoice_id": Si el usuario pide explícitamente "ver", "mostrar", "imprimir", o "abrir" una factura concreta (por ejemplo: "muéstrame la factura de DIGI", "quiero ver el ticket de gasolina"), busca el 'id' numérico de esa factura en los DATOS y ponlo aquí. 
-        3. Si la pregunta es general (ej: "¿cuánto gasté en total?") o hay dudas sobre qué factura quiere abrir, pon "invoice_id": null. NUNCA inventes un ID.
+        3. "invoice_id": Si el usuario pide explícitamente ver, mostrar, abrir o imprimir una factura concreta, pon su 'id' numérico. Si es una pregunta general, pon null. NUNCA inventes un ID.
         """
         
         response = gemini_model.generate_content(prompt_contextual)
